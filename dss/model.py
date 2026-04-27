@@ -86,6 +86,7 @@ class DSSModel(BaseTuner):
             "update_margin": dss_config.update_margin,
             "basis_group_name": basis_group_name,
             "shared_basis": shared_basis,
+            "module_name": current_key,
             "fan_in_fan_out": dss_config.fan_in_fan_out,
             "bias": bias,
         }
@@ -105,6 +106,7 @@ class DSSModel(BaseTuner):
                 update_margin=dss_config.update_margin,
                 basis_group_name=basis_group_name,
                 shared_basis=shared_basis,
+                module_name=current_key,
             )
         else:
             new_module = self._create_new_module(dss_config, adapter_name, target, **kwargs)

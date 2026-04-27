@@ -24,6 +24,40 @@ def _get_refresh_target(model):
     raise AttributeError("Could not find `refresh_dss_layout` on the PEFT model or its `base_model`.")
 
 
+def _emit_debug(message: str, progress_bar=None) -> None:
+    if progress_bar is not None:
+        try:
+            progress_bar.write(message)
+        except Exception:
+            pass
+    print(message, flush=True)
+
+
+def _collect_dss_health_metrics(refresh_target) -> dict[str, float]:
+    if not hasattr(refresh_target, "active_dss_layers"):
+        return {}
+    metrics: dict[str, float] = {}
+    wanted_groups = {"q_proj", "k_proj", "v_proj"}
+    for _module_name, layer, adapter_name in refresh_target.active_dss_layers():
+        last_health_stats = getattr(layer, "last_health_stats", None)
+        if not last_health_stats:
+            continue
+        stats = last_health_stats.get(adapter_name)
+        if not stats:
+            continue
+        group = str(stats.get("group", "unknown"))
+        if group not in wanted_groups:
+            continue
+        prefix = f"dss/{group}"
+        metrics[f"{prefix}/delta_base_ratio"] = float(stats["delta_base_ratio"])
+        metrics[f"{prefix}/delta_abs_max"] = float(stats["delta_abs_max"])
+        metrics[f"{prefix}/base_abs_max"] = float(stats["base_abs_max"])
+        metrics[f"{prefix}/coeff_abs_max"] = float(stats["coeff_abs_max"])
+        metrics[f"{prefix}/coeff_rms"] = float(stats["coeff_rms"])
+        metrics[f"{prefix}/active_slots"] = float(stats["active_slots"])
+    return metrics
+
+
 class DSSTrainer(Trainer):
     def create_optimizer(self):
         if self.optimizer is None:
@@ -71,6 +105,13 @@ class DSSTrainer(Trainer):
                     loss = model(**batch).loss
                     loss = loss / self.args.gradient_accumulation_steps
 
+                if not torch.isfinite(loss):
+                    _emit_debug(
+                        f"[error] non-finite loss detected before backward: "
+                        f"micro_step={micro_step + 1}, global_step={global_step}"
+                    , progress_bar)
+                    raise FloatingPointError("Encountered non-finite loss during DSS training.")
+
                 if scaler.is_enabled():
                     scaler.scale(loss).backward()
                 else:
@@ -109,14 +150,16 @@ class DSSTrainer(Trainer):
 
                 progress_bar.update(1)
                 progress_bar.set_postfix(loss=f"{loss.item() * self.args.gradient_accumulation_steps:.4f}", lr=f"{current_lr:.2e}")
+                self.state.global_step = global_step
+                self.state.max_steps = total_steps
 
                 if self.args.logging_steps > 0 and global_step % self.args.logging_steps == 0:
-                    self.log(
-                        {
-                            "loss": loss.item() * self.args.gradient_accumulation_steps,
-                            "learning_rate": current_lr,
-                        }
-                    )
+                    logs = {
+                        "loss": loss.item() * self.args.gradient_accumulation_steps,
+                        "learning_rate": current_lr,
+                    }
+                    logs.update(_collect_dss_health_metrics(refresh_target))
+                    self.log(logs)
 
                 if self.args.save_strategy == "steps" and self.args.save_steps > 0 and global_step % self.args.save_steps == 0:
                     checkpoint_dir = f"{self.args.output_dir}/checkpoint-{global_step}"

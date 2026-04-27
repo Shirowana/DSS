@@ -17,6 +17,7 @@ REMOTE_MODEL_ROOT=${REMOTE_MODEL_ROOT:-"/data/home/7250091/date/hf_cache_models/
 LOG_ROOT=${LOG_ROOT:-"${REMOTE_PROJECT_ROOT}/logs_commonsense"}
 OUTPUT_ROOT=${OUTPUT_ROOT:-"${REMOTE_PROJECT_ROOT}/output"}
 RESULT_ROOT=${RESULT_ROOT:-"${REMOTE_PROJECT_ROOT}/results_commonsense"}
+EXPERIMENT_ROOT=${EXPERIMENT_ROOT:-"${REMOTE_PROJECT_ROOT}/experiments/commonsense"}
 TIMESTAMP=${TIMESTAMP:-$(date +"%Y%m%d_%H%M%S")}
 
 MODEL_NAME=${MODEL_NAME:-"Llama3-8B"}
@@ -49,10 +50,16 @@ LR=${LR:-"1e-4"}
 WEIGHT_DECAY=${WEIGHT_DECAY:-0.0}
 WARMUP_STEPS=${WARMUP_STEPS:-100}
 LOGGING_STEPS=${LOGGING_STEPS:-10}
-SAVE_STEPS=${SAVE_STEPS:-5000}
+SAVE_STEPS=${SAVE_STEPS:-10000}
 NUM_WORKERS=${NUM_WORKERS:-0}
+REPORT_TO=${REPORT_TO:-"none"}
+EXPERIMENT_RECORD_ENABLED=${EXPERIMENT_RECORD_ENABLED:-1}
+EXPERIMENT_MD=${EXPERIMENT_MD:-}
+DSS_HEALTH_LOG_ENABLED=${DSS_HEALTH_LOG_ENABLED:-1}
+DSS_HEALTH_LOG_EVERY=${DSS_HEALTH_LOG_EVERY:-500}
+DSS_HEALTH_LOG_MODULE_SUFFIXES=${DSS_HEALTH_LOG_MODULE_SUFFIXES:-"layers.0.self_attn.q_proj,layers.0.self_attn.k_proj,layers.0.self_attn.v_proj"}
 
-SHARED_BASIS_PATH=${SHARED_BASIS_PATH:-"${REMOTE_PROJECT_ROOT}/basis/llama3_8b_dss_basis.pt"}
+SHARED_BASIS_PATH=${SHARED_BASIS_PATH:-"${REMOTE_PROJECT_ROOT}/basis/llama3_8b_dss_basis_identity_fro.pt"}
 BASIS_OFFSET=${BASIS_OFFSET:-0}
 BASIS_LR=${BASIS_LR:-0.01}
 BASIS_ITERS=${BASIS_ITERS:-1000}
@@ -86,8 +93,11 @@ conda activate quest
 export PYTHONPATH="${REMOTE_PEFT_SRC}:${REMOTE_PROJECT_ROOT}:${PYTHONPATH:-}"
 export WANDB_PROJECT=${WANDB_PROJECT:-"dss_commonsense"}
 export WANDB_NAME=${WANDB_NAME:-"${RUN_NAME}"}
+export DSS_HEALTH_LOG_ENABLED
+export DSS_HEALTH_LOG_EVERY
+export DSS_HEALTH_LOG_MODULE_SUFFIXES
 
-mkdir -p "${LOG_ROOT}" "${OUTPUT_ROOT}" "${RESULT_ROOT}" "${OUTPUT_DIR}"
+mkdir -p "${LOG_ROOT}" "${OUTPUT_ROOT}" "${RESULT_ROOT}" "${OUTPUT_DIR}" "${EXPERIMENT_ROOT}"
 cd "${REMOTE_PROJECT_ROOT}"
 
 echo "MODEL_PATH=${MODEL_PATH}"
@@ -95,6 +105,15 @@ echo "DATASET_PATH=${DATASET_PATH}"
 echo "SHARED_BASIS_PATH=${SHARED_BASIS_PATH}"
 echo "OUTPUT_DIR=${OUTPUT_DIR}"
 echo "LOG_FILE=${LOG_FILE}"
+echo "REPORT_TO=${REPORT_TO}"
+echo "EXPERIMENT_RECORD_ENABLED=${EXPERIMENT_RECORD_ENABLED}"
+echo "EXPERIMENT_ROOT=${EXPERIMENT_ROOT}"
+if [[ -n "${EXPERIMENT_MD}" ]]; then
+    echo "EXPERIMENT_MD=${EXPERIMENT_MD}"
+fi
+echo "DSS_HEALTH_LOG_ENABLED=${DSS_HEALTH_LOG_ENABLED}"
+echo "DSS_HEALTH_LOG_EVERY=${DSS_HEALTH_LOG_EVERY}"
+echo "DSS_HEALTH_LOG_MODULE_SUFFIXES=${DSS_HEALTH_LOG_MODULE_SUFFIXES}"
 
 if [[ "${FIT_BASIS}" == "1" || ! -f "${SHARED_BASIS_PATH}" ]]; then
     if [[ ! -f "${SHARED_BASIS_SCRIPT}" ]]; then
@@ -159,6 +178,7 @@ cmd=(
     --weight_decay "${WEIGHT_DECAY}"
     --warmup_steps "${WARMUP_STEPS}"
     --logging_steps "${LOGGING_STEPS}"
+    --report_to "${REPORT_TO}"
     --save_steps "${SAVE_STEPS}"
     --num_workers "${NUM_WORKERS}"
     --output_dir "${OUTPUT_DIR}"
@@ -182,3 +202,16 @@ train_start=$(date +%s)
 "${cmd[@]}" 2>&1 | tee -a "${LOG_FILE}"
 train_end=$(date +%s)
 echo "[train] done: $(date), elapsed=$(format_elapsed $((train_end - train_start)))" | tee -a "${LOG_FILE}"
+
+if [[ "${EXPERIMENT_RECORD_ENABLED}" == "1" ]]; then
+    record_cmd=(
+        python scripts/create_commonsense_experiment_record.py
+        --log_file "${LOG_FILE}"
+        --output_dir "${OUTPUT_DIR}"
+        --experiment_root "${EXPERIMENT_ROOT}"
+    )
+    if [[ -n "${EXPERIMENT_MD}" ]]; then
+        record_cmd+=(--experiment_md "${EXPERIMENT_MD}")
+    fi
+    "${record_cmd[@]}" 2>&1 | tee -a "${LOG_FILE}"
+fi

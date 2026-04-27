@@ -20,7 +20,8 @@ try:
 except ImportError as exc:  # pragma: no cover
     raise RuntimeError("This script requires `peft` with DSS registration support.") from exc
 
-from dss import DSSConfig, DSSTrainer  # noqa: F401 - importing dss registers the PEFT method
+from peft.tuners.dss import DSSConfig  # noqa: F401 - importing peft.tuners.dss registers the PEFT method
+from trainer import DSSTrainer
 
 
 REMOTE_PROJECT_ROOT = Path("/data/home/7250091/date/DSS")
@@ -90,6 +91,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--save_steps", type=int, default=0)
     parser.add_argument("--save_total_limit", type=int, default=3)
     parser.add_argument("--logging_steps", type=int, default=100)
+    parser.add_argument("--report_to", type=str, default="none")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--num_workers", type=int, default=0)
     return parser.parse_args()
@@ -212,7 +214,7 @@ def main() -> None:
         dataloader_num_workers=args.num_workers,
         dataloader_drop_last=True,
         remove_unused_columns=False,
-        report_to=[],
+        report_to=[] if args.report_to.lower() in {"none", "no", "false", "0"} else [args.report_to],
         disable_tqdm=False,
     )
 

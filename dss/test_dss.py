@@ -16,6 +16,7 @@ if "peft" not in sys.modules:
     peft_utils = types.ModuleType("peft.utils")
     peft_config = types.ModuleType("peft.config")
     peft_tuners = types.ModuleType("peft.tuners")
+    peft_tuners_dss = types.ModuleType("peft.tuners.dss")
     peft_buffer_dict = types.ModuleType("peft.tuners._buffer_dict")
     peft_tuners_utils = types.ModuleType("peft.tuners.tuners_utils")
 
@@ -93,6 +94,9 @@ if "peft" not in sys.modules:
     def _get_submodules(model, key):
         raise AttributeError
 
+    def create_dss_optimizer(*args, **kwargs):
+        raise NotImplementedError("test stub")
+
     peft_utils.register_peft_method = register_peft_method
     peft_utils.PeftType = PeftType
     peft_utils.TRANSFORMERS_MODELS_TO_DSS_TARGET_MODULES_MAPPING = {}
@@ -104,29 +108,44 @@ if "peft" not in sys.modules:
     peft_tuners_utils.BaseTuner = BaseTuner
     peft_tuners_utils.check_target_module_exists = check_target_module_exists
     peft_tuners_utils.check_adapters_to_merge = check_adapters_to_merge
+    peft_tuners_dss.create_dss_optimizer = create_dss_optimizer
 
     sys.modules["peft"] = peft_mod
     sys.modules["peft.utils"] = peft_utils
     sys.modules["peft.config"] = peft_config
     sys.modules["peft.tuners"] = peft_tuners
+    sys.modules["peft.tuners.dss"] = peft_tuners_dss
     sys.modules["peft.tuners._buffer_dict"] = peft_buffer_dict
     sys.modules["peft.tuners.tuners_utils"] = peft_tuners_utils
 
 if "transformers.pytorch_utils" not in sys.modules:
     transformers_mod = types.ModuleType("transformers")
+    trainer_utils_mod = types.ModuleType("transformers.trainer_utils")
     pytorch_utils_mod = types.ModuleType("transformers.pytorch_utils")
+
+    class Trainer:
+        pass
+
+    class TrainOutput:
+        def __init__(self, global_step, training_loss, metrics):
+            self.global_step = global_step
+            self.training_loss = training_loss
+            self.metrics = metrics
 
     class Conv1D(torch.nn.Module):
         def __init__(self, nf, nx):
             super().__init__()
             self.weight = torch.nn.Parameter(torch.zeros(nx, nf))
 
+    transformers_mod.Trainer = Trainer
+    trainer_utils_mod.TrainOutput = TrainOutput
     pytorch_utils_mod.Conv1D = Conv1D
     sys.modules["transformers"] = transformers_mod
+    sys.modules["transformers.trainer_utils"] = trainer_utils_mod
     sys.modules["transformers.pytorch_utils"] = pytorch_utils_mod
 
 from new.dss.layer import DSSLinear
-from new.dss.shared_basis import SharedBasisEntry
+from new.dss.shared_basis import SharedBasisEntry, SharedBasisPack, normalize_inverse_basis_to_identity_fro
 
 
 def make_identity_basis(out_features: int, in_features: int) -> SharedBasisEntry:
@@ -139,6 +158,45 @@ def make_identity_basis(out_features: int, in_features: int) -> SharedBasisEntry
         shape=(out_features, in_features),
         offset=0,
     )
+
+
+class SharedBasisNormalizationTests(unittest.TestCase):
+    def test_identity_fro_normalization_matches_identity_norms(self):
+        A_inv = torch.diag(torch.tensor([10.0, 2.0, 0.5]))
+        B_inv = torch.diag(torch.tensor([4.0, 3.0]))
+
+        C, D, c, d = normalize_inverse_basis_to_identity_fro(A_inv, B_inv, shape=(3, 2))
+
+        self.assertAlmostEqual(float(C.norm().item()), 3**0.5, places=6)
+        self.assertAlmostEqual(float(D.norm().item()), 2**0.5, places=6)
+        self.assertAlmostEqual(c, (3**0.5) / float(A_inv.norm().item()), places=6)
+        self.assertAlmostEqual(d, (2**0.5) / float(B_inv.norm().item()), places=6)
+
+        delta_lambda = torch.randn(3, 2)
+        delta_w = C @ delta_lambda @ D
+        self.assertEqual(tuple(delta_w.shape), (3, 2))
+
+    def test_old_basis_payload_without_metadata_still_loads(self):
+        raw = {
+            "entries": {
+                "test": {
+                    "A": torch.eye(2),
+                    "B": torch.eye(3),
+                    "A_inv": torch.eye(2),
+                    "B_inv": torch.eye(3),
+                    "shape": (2, 3),
+                    "offset": 0,
+                }
+            }
+        }
+
+        entry = SharedBasisPack._coerce_entry("test", raw["entries"]["test"])
+
+        self.assertEqual(entry.inverse_normalization, None)
+        self.assertEqual(entry.A_inv_scale, None)
+        self.assertEqual(entry.B_inv_scale, None)
+        self.assertTrue(torch.equal(entry.A_inv, torch.eye(2)))
+        self.assertTrue(torch.equal(entry.B_inv, torch.eye(3)))
 
 
 def dense_core_from_slots(

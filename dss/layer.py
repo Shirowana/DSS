@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import warnings
 from dataclasses import dataclass
 from math import ceil
@@ -98,6 +99,12 @@ class GPUQuantileEstimator:
 
 
 class DSSLayer(BaseTunerLayer):
+    DEFAULT_HEALTH_LOG_SUFFIXES = (
+        "layers.0.self_attn.q_proj",
+        "layers.0.self_attn.k_proj",
+        "layers.0.self_attn.v_proj",
+    )
+
     adapter_layer_names = ("coefficient",)
     other_param_names = (
         "coefficient_indices",
@@ -120,6 +127,14 @@ class DSSLayer(BaseTunerLayer):
         self.kwargs = kwargs
         self.quantile_lr = 0.01
         self.quantile_alpha = 0.0
+        self.delta_scale = float(os.environ.get("DSS_DELTA_SCALE", "1.0"))
+        self.health_log_enabled = os.environ.get("DSS_HEALTH_LOG_ENABLED", "1") not in {"0", "false", "False"}
+        self.health_log_every = max(1, int(os.environ.get("DSS_HEALTH_LOG_EVERY", "500")))
+        suffixes = os.environ.get("DSS_HEALTH_LOG_MODULE_SUFFIXES")
+        if suffixes:
+            self.health_log_suffixes = tuple(suffix.strip() for suffix in suffixes.split(",") if suffix.strip())
+        else:
+            self.health_log_suffixes = self.DEFAULT_HEALTH_LOG_SUFFIXES
 
         self.runtime: dict[str, AdapterRuntime] = {}
         self.hparams: dict[str, AdapterHyperParams] = {}
@@ -128,6 +143,12 @@ class DSSLayer(BaseTunerLayer):
         self.search_quantile_estimator: dict[str, GPUQuantileEstimator] = {}
         self.candidate_grad_sums: dict[str, Optional[torch.Tensor]] = {}
         self.candidate_grad_sq_sums: dict[str, Optional[torch.Tensor]] = {}
+        self.last_promoted_slot_positions: dict[str, torch.Tensor] = {}
+        self.last_promoted_flat_indices: dict[str, torch.Tensor] = {}
+        self.basis_group_name: dict[str, str] = {}
+        self.module_name: dict[str, str] = {}
+        self.health_forward_calls: dict[str, int] = {}
+        self.last_health_stats: dict[str, dict[str, float | int | str]] = {}
 
         base_layer = self.get_base_layer()
         if isinstance(base_layer, nn.Linear):
@@ -144,6 +165,65 @@ class DSSLayer(BaseTunerLayer):
 
     def _adapter_label(self, adapter_name: str) -> str:
         return str(adapter_name)
+
+    def _should_emit_health_log(self, adapter_name: str) -> bool:
+        if not self.health_log_enabled:
+            return False
+        module_name = self.module_name.get(adapter_name, "")
+        if self.health_log_suffixes and not any(module_name.endswith(suffix) for suffix in self.health_log_suffixes):
+            return False
+        calls = self.health_forward_calls.get(adapter_name, 0) + 1
+        self.health_forward_calls[adapter_name] = calls
+        return calls % self.health_log_every == 0
+
+    def _emit_health_log(
+        self,
+        adapter_name: str,
+        result: torch.Tensor,
+        y_core: torch.Tensor,
+        y_delta: torch.Tensor,
+    ) -> None:
+        runtime = self.runtime[adapter_name]
+        if runtime.curr_count <= 0:
+            return
+        coeff = self.coefficient[adapter_name][: runtime.curr_count].detach().float()
+        base_abs_max = result.detach().float().abs().max().item() if result.numel() > 0 else 0.0
+        y_core_abs_max = y_core.detach().float().abs().max().item() if y_core.numel() > 0 else 0.0
+        y_delta_abs_max = y_delta.detach().float().abs().max().item() if y_delta.numel() > 0 else 0.0
+        delta_abs_max = abs(self.delta_scale) * y_delta_abs_max
+        coeff_abs_max = coeff.abs().max().item() if coeff.numel() > 0 else 0.0
+        coeff_rms = coeff.square().mean().sqrt().item() if coeff.numel() > 0 else 0.0
+        ratio = delta_abs_max / max(base_abs_max, 1e-12)
+        stats = {
+            "module": self.module_name.get(adapter_name, "<unknown>"),
+            "group": self.basis_group_name.get(adapter_name, "unknown"),
+            "forward_calls": self.health_forward_calls.get(adapter_name, 0),
+            "active_slots": runtime.curr_count,
+            "base_abs_max": base_abs_max,
+            "delta_abs_max": delta_abs_max,
+            "delta_base_ratio": ratio,
+            "coeff_abs_max": coeff_abs_max,
+            "coeff_rms": coeff_rms,
+            "y_core_abs_max": y_core_abs_max,
+            "y_delta_abs_max": y_delta_abs_max,
+        }
+        self.last_health_stats[adapter_name] = stats
+        print(
+            "[dss-health] "
+            f"module={stats['module']} "
+            f"group={stats['group']} "
+            f"adapter={adapter_name} "
+            f"forward_calls={stats['forward_calls']} "
+            f"active_slots={stats['active_slots']} "
+            f"base_abs_max={base_abs_max:.4e} "
+            f"delta_abs_max={delta_abs_max:.4e} "
+            f"delta_base_ratio={ratio:.4e} "
+            f"coeff_abs_max={coeff_abs_max:.4e} "
+            f"coeff_rms={coeff_rms:.4e} "
+            f"y_core_abs_max={y_core_abs_max:.4e} "
+            f"y_delta_abs_max={y_delta_abs_max:.4e}",
+            flush=True,
+        )
 
     #把候选池全部清空
     def clear_candidate_state(self, adapter_name: str) -> None:
@@ -394,6 +474,9 @@ class DSSLayer(BaseTunerLayer):
         selected: torch.Tensor,
     ) -> int:
         if selected.numel() == 0:
+            device = self._adapter_device(adapter_name)
+            self.last_promoted_slot_positions[adapter_name] = torch.empty(0, device=device, dtype=torch.long)
+            self.last_promoted_flat_indices[adapter_name] = torch.empty(0, device=device, dtype=torch.long)
             return 0
 
         runtime = self.runtime[adapter_name]
@@ -403,6 +486,13 @@ class DSSLayer(BaseTunerLayer):
         self.coefficient_indices[adapter_name][start:end] = new_indices
         self.coefficient[adapter_name].data[start:end].zero_()
         self.elite_bitset[adapter_name][new_indices] = True
+        self.last_promoted_slot_positions[adapter_name] = torch.arange(
+            start,
+            end,
+            device=new_indices.device,
+            dtype=torch.long,
+        )
+        self.last_promoted_flat_indices[adapter_name] = new_indices.clone()
         runtime.curr_count = end
         return int(selected.numel())
 
@@ -428,12 +518,15 @@ class DSSLayer(BaseTunerLayer):
             runtime.update_flag = False
             runtime.stage2_start_step = global_step + runtime.steady_phase
             self.clear_candidate_state(adapter_name)
+            print(f"{adapter_label} 已切换到 stage2，steady={runtime.steady_phase}")
             return report
 
         x_mean = self.compute_x_mean(adapter_name)
         self.update_distribution(adapter_name, x_mean)
         selected = self.select_location(adapter_name, x_mean, remaining_budget)
         promoted_slots = self.apply_stage1_promotions(adapter_name, selected)
+        if promoted_slots > 0:
+            print(f"{adapter_label} stage1 晋升 {promoted_slots} 个参数，当前已激活 {runtime.curr_count} / {total_budget}")
 
         if runtime.curr_count >= total_budget:
             runtime.phase = "stage2"
@@ -442,6 +535,7 @@ class DSSLayer(BaseTunerLayer):
             runtime.update_flag = False
             runtime.stage2_start_step = global_step + runtime.steady_phase
             self.clear_candidate_state(adapter_name)
+            print(f"{adapter_label} 已切换到 stage2，steady={runtime.steady_phase}")
         else:
             self.refresh_candidate_batch(adapter_name)
 
@@ -527,6 +621,7 @@ class DSSLayer(BaseTunerLayer):
     ) -> StageReport:
         runtime = self.runtime[adapter_name]
         hparams = self.hparams[adapter_name]
+        adapter_label = self._adapter_label(adapter_name)
         if runtime.phase != "stage2":
             return StageReport()
         if not hparams.stage2_enabled:
@@ -554,6 +649,8 @@ class DSSLayer(BaseTunerLayer):
 
         if prune_slots.numel() == 0 or grow_slots.numel() == 0:
             report = StageReport(updated=True, skipped_slots=max(requested, 0))
+            if requested > 0:
+                print(f"{adapter_label} stage2 到更新点，但本轮未替换参数")
         else:
             report = self.apply_stage2_replacements(
                 adapter_name,
@@ -565,6 +662,10 @@ class DSSLayer(BaseTunerLayer):
                 grad_accumulation_steps=grad_accumulation_steps,
             )
             report.skipped_slots = max(requested - report.grown_slots, 0)
+            print(
+                f"{adapter_label} stage2 替换：prune={report.pruned_slots}，"
+                f"grow={report.grown_slots}，skip={report.skipped_slots}"
+            )
 
         self.clear_candidate_state(adapter_name)
         runtime.update_flag = False
@@ -624,6 +725,7 @@ class DSSLinear(nn.Module, DSSLayer):
         shared_basis: SharedBasisEntry,
 
         fan_in_fan_out: bool = False,
+        module_name: Optional[str] = None,
         **kwargs,
     ) -> None:
         super().__init__()
@@ -645,6 +747,7 @@ class DSSLinear(nn.Module, DSSLayer):
             update_margin=update_margin,
             basis_group_name=basis_group_name,
             shared_basis=shared_basis,
+            module_name=module_name,
         )
 
     def update_layer(
@@ -663,6 +766,7 @@ class DSSLinear(nn.Module, DSSLayer):
         update_margin: float,
         basis_group_name: str,
         shared_basis: SharedBasisEntry,
+        module_name: Optional[str] = None,
     ) -> None:
         core_shape = tuple(shared_basis.shape)
         shared_basis.validate(core_shape)
@@ -688,6 +792,9 @@ class DSSLinear(nn.Module, DSSLayer):
         self.elite_bitset[adapter_name] = torch.zeros(self.out_features * self.in_features, device=device, dtype=torch.bool)
         self.basis_A_inv[adapter_name] = shared_basis.A_inv.to(device=device, dtype=torch.float32)
         self.basis_B_inv[adapter_name] = shared_basis.B_inv.to(device=device, dtype=torch.float32)
+        self.basis_group_name[adapter_name] = basis_group_name
+        self.module_name[adapter_name] = module_name or ""
+        self.health_forward_calls[adapter_name] = 0
 
         self.hparams[adapter_name] = AdapterHyperParams(
             grad_store_steps=grad_store_steps,
@@ -789,7 +896,9 @@ class DSSLinear(nn.Module, DSSLayer):
 
             y_core = F.linear(x_basis, lambda_dense)
             y_delta = torch.matmul(y_core, A_inv.transpose(0, 1))
-            result = result + y_delta.to(dtype=result.dtype)
+            if self._should_emit_health_log(active_adapter):
+                self._emit_health_log(active_adapter, result, y_core, y_delta)
+            result = result + (self.delta_scale * y_delta).to(dtype=result.dtype)
             '''
             base:   y_base = base_layer(x)
 

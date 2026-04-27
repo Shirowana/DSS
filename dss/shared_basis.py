@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from math import sqrt
 from pathlib import Path
 from typing import Any, Iterable, Optional
 
@@ -81,6 +82,30 @@ def dense_core_grad_from_weight_grad(grad_w: Tensor, A_inv: Tensor, B_inv: Tenso
     return A_inv.transpose(0, 1) @ grad_w @ B_inv.transpose(0, 1)
 
 
+def normalize_inverse_basis_to_identity_fro(
+    A_inv: Tensor,
+    B_inv: Tensor,
+    shape: tuple[int, int],
+) -> tuple[Tensor, Tensor, float, float]:
+    """Scale inverse-basis matrices to match same-shape identity Frobenius norms.
+
+    For W in R^{p x n}, A_inv has shape p x p and B_inv has shape n x n.
+    This returns C=c*A_inv and D=d*B_inv such that:
+
+        ||C||_F = ||I_p||_F = sqrt(p)
+        ||D||_F = ||I_n||_F = sqrt(n)
+
+    C and D are normalized inverse-basis matrices for the DSS delta path; they
+    are no longer strict mathematical inverses of the stored A and B.
+    """
+    p, n = tuple(shape)
+    A_norm = A_inv.norm().clamp_min(1e-12)
+    B_norm = B_inv.norm().clamp_min(1e-12)
+    A_inv_scale = float(sqrt(float(p)) / A_norm.item())
+    B_inv_scale = float(sqrt(float(n)) / B_norm.item())
+    return A_inv * A_inv_scale, B_inv * B_inv_scale, A_inv_scale, B_inv_scale
+
+
 @dataclass
 class SharedBasisEntry:
     """Frozen shared transforms for one functional module group."""
@@ -92,6 +117,9 @@ class SharedBasisEntry:
     B_inv: Tensor
     shape: tuple[int, int]
     offset: int = 0
+    A_inv_scale: Optional[float] = None
+    B_inv_scale: Optional[float] = None
+    inverse_normalization: Optional[str] = None
 
     def validate(self, expected_shape: tuple[int, int]) -> None:
         if tuple(expected_shape) != tuple(self.shape):
@@ -108,6 +136,9 @@ class SharedBasisEntry:
             "B_inv": self.B_inv,
             "shape": tuple(self.shape),
             "offset": self.offset,
+            "A_inv_scale": self.A_inv_scale,
+            "B_inv_scale": self.B_inv_scale,
+            "inverse_normalization": self.inverse_normalization,
         }
 
 
@@ -178,6 +209,9 @@ class SharedBasisPack:
             B_inv=B_inv,
             shape=shape,
             offset=offset,
+            A_inv_scale=raw_entry.get("A_inv_scale"),
+            B_inv_scale=raw_entry.get("B_inv_scale"),
+            inverse_normalization=raw_entry.get("inverse_normalization"),
         )
 
 
@@ -207,8 +241,13 @@ def fit_shared_basis_for_group(
         init_A=init_A,
         init_B=init_B,
     )
-    A_inv = torch.linalg.inv(A)
-    B_inv = torch.linalg.inv(B)
+    A_inv_raw = torch.linalg.inv(A)
+    B_inv_raw = torch.linalg.inv(B)
+    A_inv, B_inv, A_inv_scale, B_inv_scale = normalize_inverse_basis_to_identity_fro(
+        A_inv_raw,
+        B_inv_raw,
+        tuple(weight_list[0].shape),
+    )
     return SharedBasisEntry(
         group_name=group_name,
         A=A.detach().cpu(),
@@ -217,4 +256,7 @@ def fit_shared_basis_for_group(
         B_inv=B_inv.detach().cpu(),
         shape=tuple(weight_list[0].shape),
         offset=offset,
+        A_inv_scale=A_inv_scale,
+        B_inv_scale=B_inv_scale,
+        inverse_normalization="identity_fro",
     )

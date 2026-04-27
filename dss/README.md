@@ -125,6 +125,24 @@ refresh_dss_layout(global_step, total_steps, optimizer, grad_accumulation_steps)
 
 这个函数在每个 optimizer step 后调用，用于消费当前 step 已经收集到的 candidate 梯度统计，并根据需要执行 stage1 refresh 或 stage2 prune/grow。
 
+### 项目侧脚本与 tuner 侧代码
+
+当前工程可以分成两层：
+
+- 项目侧脚本：
+  - `fit_shared_basis.py`：离线 shared basis 拟合入口。
+  - `finetune_commonsense.py`：训练启动入口，负责组装模型、数据与训练参数。
+  - `dss/trainer.py`：项目侧 `DSSTrainer`，负责自定义训练循环、`tqdm` 进度条，以及在 optimizer step 后调用 `refresh_dss_layout(...)`。
+  - `scripts/train_commonsense.sh`：远程一键训练脚本，串起 shared basis 阶段和 commonsense 训练阶段。
+- PEFT tuner 侧代码：
+  - `dss/config.py`
+  - `dss/model.py`
+  - `dss/layer.py`
+  - `dss/optimizer.py`
+  - `dss/shared_basis.py`
+
+这里要特别注意：`trainer.py` 是项目侧新增的 glue code，不属于 `peft.tuners.dss` 包核心实现，也不应该通过 `peft.tuners.dss.__init__` 导出，否则容易和 `transformers.Trainer` / `peft` 初始化形成循环导入。
+
 ## 4. 单层 DSS 状态设计
 
 核心实现位于 `layer.py`。
@@ -223,6 +241,234 @@ lambda_dense = lambda_flat.view(out_features, in_features)
 ```
 
 因为这个过程是可微的，所以 elite `coefficient` 的梯度由 PyTorch autograd 自动回传，不需要手动计算 elite grad。
+
+### candidate 池的延迟初始化
+
+当前实现里，第一次 candidate 池初始化不是在 `update_layer()` 建模阶段完成，而是在该层第一次真正进入 `stage1` 前向、且 `candidate_indices` 仍为空时，才按需调用 `refresh_candidate_batch(...)`。
+
+这样做的目的不是改变 DSS 的结构更新语义，而是避免：
+
+- `get_peft_model()` / `update_layer()` 阶段就在 CPU 上为所有层提前构造 candidate 池。
+- 远程容器里出现“训练开始前卡住、GPU 占用很低”的启动问题。
+
+因此，这里调整的是**第一次 candidate 池创建的时机**，不是后续正式的 `optimizer.step() -> refresh_dss_layout(...)` 更新路径。
+
+## 本地 / 远程路径约定
+
+当前开发和运行环境默认采用下面这组路径约定：
+
+- 本地项目根目录：`E:\code\new`
+- 远程项目根目录：`/data/home/7250091/date/DSS`
+- 远程 PEFT 源码根目录：`/data/home/7250091/date/quest20260313/peft/src`
+- 远程 DSS tuner 目录：`/data/home/7250091/date/quest20260313/peft/src/peft/tuners/dss`
+
+文件同步时，通常按下面的规则放置：
+
+- 本地 `new/dss/*.py` 中属于 tuner 核心的文件，上传到远程：
+  - `/data/home/7250091/date/quest20260313/peft/src/peft/tuners/dss/`
+- 本地项目侧脚本上传到远程项目根：
+  - `new/finetune_commonsense.py -> /data/home/7250091/date/DSS/finetune_commonsense.py`
+  - `new/dss/trainer.py -> /data/home/7250091/date/DSS/trainer.py`
+  - `new/fit_shared_basis.py -> /data/home/7250091/date/DSS/fit_shared_basis.py`
+  - `new/scripts/train_commonsense.sh -> /data/home/7250091/date/DSS/scripts/train_commonsense.sh`
+
+训练侧导入也按这个分层组织：
+
+- `trainer.py` 必须放在远程项目根侧，可由 `finetune_commonsense.py` 直接 `from trainer import DSSTrainer`
+- `trainer.py` 内部创建 optimizer 时，使用：
+
+```python
+from peft.tuners.dss import create_dss_optimizer
+```
+
+- `DSSTrainer` 不应通过 `peft.tuners.dss.__init__` 导出
+
+这样可以避免 `Trainer -> peft -> dss.__init__ -> Trainer` 这一类循环导入问题。
+
+## 推荐运行顺序
+
+当前推荐的远程运行方式不是手工逐条拼 Python 命令，而是优先使用：
+
+```bash
+bash scripts/train_commonsense.sh
+```
+
+这套脚本的真实流程是：
+
+1. 先确认远程路径和 `PYTHONPATH`
+2. 如果 `shared_basis_path` 已存在，则直接进入训练阶段
+3. 如果 basis 文件不存在，先运行 shared basis 阶段
+4. 然后从项目根目录启动 `finetune_commonsense.py`
+
+当前最关键的远程变量包括：
+
+- `REMOTE_PROJECT_ROOT=/data/home/7250091/date/DSS`
+- `REMOTE_PEFT_SRC=/data/home/7250091/date/quest20260313/peft/src`
+- `MODEL_PATH=/data/home/7250091/date/hf_cache_models/models/Meta-Llama-3-8B`
+- `SHARED_BASIS_PATH=/data/home/7250091/date/DSS/basis/llama3_8b_dss_basis_identity_fro.pt`
+
+脚本会自动把：
+
+```bash
+PYTHONPATH=${REMOTE_PEFT_SRC}:${REMOTE_PROJECT_ROOT}:${PYTHONPATH:-}
+```
+
+加入环境，从而同时找到：
+
+- PEFT tuner 侧的 `peft.tuners.dss.*`
+- 项目根侧的 `trainer.py`、`finetune_commonsense.py`
+
+## 当前实现特征
+
+当前代码有几个工程特征，新的 AI 或新同学最好先知道：
+
+- 训练使用的是项目侧 `DSSTrainer`，不是完全复用 HuggingFace 默认 `Trainer` 的内部训练循环。
+- 训练进度显示采用类似 HF / DiaBlo 风格的 `tqdm`。
+- shared basis 采用“离线拟合、在线加载”的流程。
+- 代码里保留了少量调试入口和实验开关，但 README 正文不展开具体数值排查历史。
+
+如果后续需要继续做数值诊断，可以直接查看训练日志，以及 `layer.py / trainer.py / optimizer.py` 中保留的调试入口。
+
+## Commonsense 实验记录
+
+commonsense 实验记录默认放在：
+
+```bash
+/data/home/7250091/date/DSS/experiments/commonsense
+```
+
+这个目录不是模型输出目录，而是实验索引目录。它和训练、评测目录的关系是：
+
+```text
+output/                 -> adapter 和 checkpoint
+logs_commonsense/       -> 训练日志、eval 日志
+results_commonsense/    -> eval 逐样本预测 JSON
+experiments/commonsense -> 实验 md 总结和 index.csv
+```
+
+每次实验建议最终形成两类记录：
+
+- `<run_name>.md`：单次实验的完整说明，适合人工阅读。
+- `index.csv`：所有实验的一行式总索引，适合快速检索和横向对比。
+
+### 自动记录脚本
+
+当前有两个项目侧脚本负责实验记录：
+
+```text
+scripts/create_commonsense_experiment_record.py
+scripts/append_commonsense_eval_record.py
+```
+
+`create_commonsense_experiment_record.py` 用于训练结束后生成或更新实验记录。它读取：
+
+- `output_dir/training_args.json`
+- `logs_commonsense/<timestamp>.log`
+- `output_dir/checkpoint-*`
+
+然后写入：
+
+- `experiments/commonsense/<run_name>.md`
+- `experiments/commonsense/index.csv`
+
+记录内容包括：
+
+- 训练超参数：model、target modules、basis、lr、scheduler、stage2 参数等。
+- 训练结果：steps、epoch、final loss、final lr、elapsed、是否出现 NaN/Inf。
+- 路径：adapter、log、record。
+- DSS health 摘要：q/k/v 的 `delta_base_ratio`、`coeff_abs_max`、`coeff_rms`。
+- Eval 结果占位区。
+
+`append_commonsense_eval_record.py` 用于 eval 结束后追加评测结果。它读取：
+
+- `results_commonsense/<eval_run>/*.json`
+
+每个 JSON 是一个 dataset 的逐样本预测结果，脚本根据每条样本的 `flag` 字段统计 accuracy，然后写回：
+
+- 对应实验 `.md` 的 `Eval 结果` 区块。
+- `index.csv` 中的 `eval_avg` 和各 dataset 分数列。
+
+Eval 区块使用固定 marker，可重复运行并覆盖旧结果：
+
+```text
+<!-- EVAL_RESULTS_BEGIN -->
+...
+<!-- EVAL_RESULTS_END -->
+```
+
+### 与训练脚本的关系
+
+`scripts/train_commonsense.sh` 默认会在训练结束后自动调用：
+
+```bash
+python scripts/create_commonsense_experiment_record.py \
+  --log_file "${LOG_FILE}" \
+  --output_dir "${OUTPUT_DIR}" \
+  --experiment_root "${EXPERIMENT_ROOT}"
+```
+
+相关环境变量：
+
+```bash
+EXPERIMENT_RECORD_ENABLED=1
+EXPERIMENT_ROOT=/data/home/7250091/date/DSS/experiments/commonsense
+EXPERIMENT_MD=
+```
+
+默认 `EXPERIMENT_MD` 为空时，记录文件名由 adapter 输出目录名决定：
+
+```text
+experiments/commonsense/<run_name>.md
+```
+
+如需关闭自动记录：
+
+```bash
+EXPERIMENT_RECORD_ENABLED=0 bash scripts/train_commonsense.sh
+```
+
+### 与 eval 脚本的关系
+
+`scripts/eval_commonsense.sh` 默认 `BATCH_SIZE=1`，评测完所有 dataset 后会自动调用：
+
+```bash
+python scripts/append_commonsense_eval_record.py \
+  --experiment_md "${EXPERIMENT_MD}" \
+  --eval_output_dir "${OUTPUT_DIR}" \
+  --experiment_root "${EXPERIMENT_ROOT}"
+```
+
+如果不手动指定 `EXPERIMENT_MD`，脚本会按 adapter 目录名推断：
+
+```text
+${EXPERIMENT_ROOT}/$(basename "${ADAPTER_PATH}").md
+```
+
+因此最常见的流程是：
+
+```bash
+bash scripts/train_commonsense.sh
+bash scripts/eval_commonsense.sh /data/home/7250091/date/DSS/output/<run_name>
+```
+
+如果是给已经完成的旧实验补记录，可以先手动生成 md：
+
+```bash
+python scripts/create_commonsense_experiment_record.py \
+  --log_file /data/home/7250091/date/DSS/logs_commonsense/20260426_184846.log \
+  --output_dir /data/home/7250091/date/DSS/output/commonsense_Llama3-8B_dss_nf180000_cand10000_gs10_20260426_184846 \
+  --experiment_root /data/home/7250091/date/DSS/experiments/commonsense
+```
+
+然后 eval 时指定同一个 md：
+
+```bash
+MODEL_PATH=/data/home/7250091/date/hf_cache_models/models/Meta-Llama-3-8B \
+BATCH_SIZE=1 \
+EXPERIMENT_MD=/data/home/7250091/date/DSS/experiments/commonsense/commonsense_Llama3-8B_dss_nf180000_cand10000_gs10_20260426_184846.md \
+bash scripts/eval_commonsense.sh \
+  /data/home/7250091/date/DSS/output/commonsense_Llama3-8B_dss_nf180000_cand10000_gs10_20260426_184846
+```
 
 ## 6. 反向传播与 candidate probe hook
 
@@ -422,7 +668,7 @@ exp_avg_sq[prune_slots] = incoming_avg_grad_sq
 外部训练时推荐：
 
 ```python
-from dss import create_dss_optimizer
+from peft.tuners.dss import create_dss_optimizer
 optimizer = create_dss_optimizer(model, lr=...)
 ```
 

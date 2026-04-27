@@ -181,7 +181,7 @@ def create_dss_optimizer(
     momentum_dtype: torch.dtype = torch.float32,
 ):
     """Create the default outer optimizer for trainable DSS coefficients only."""
-    params = [parameter for _, parameter in model.named_parameters() if parameter.requires_grad]
+    params = [parameter for parameter in model.parameters() if parameter.requires_grad]
     optimizer = DSSAdamW(
         params,
         lr=lr,
