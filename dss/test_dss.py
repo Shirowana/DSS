@@ -381,6 +381,56 @@ class DSSLayerStageTests(unittest.TestCase):
         layer.unmerge()
         self.assertTrue(torch.allclose(layer.get_base_layer().weight, base_weight))
 
+    def test_sparse_checkpoint_export_is_compact_prefix(self):
+        layer = self.build_layer(stage2_enabled=True)
+        runtime = layer.runtime["default"]
+        runtime.phase = "stage2"
+        runtime.curr_count = 2
+        runtime.current_step = 1
+        runtime.update_rounds = 3
+        layer.coefficient["default"].data[:2] = torch.tensor([0.25, -0.5])
+        layer.coefficient_indices["default"][:2] = torch.tensor([1, 7], dtype=torch.long)
+
+        exported = layer.export_sparse_checkpoint("default")
+
+        self.assertEqual(tuple(exported["coefficient"].shape), (2,))
+        self.assertEqual(tuple(exported["coefficient_indices"].shape), (2,))
+        self.assertTrue(torch.equal(exported["coefficient"], torch.tensor([0.25, -0.5])))
+        self.assertTrue(torch.equal(exported["coefficient_indices"], torch.tensor([1, 7], dtype=torch.long)))
+
+    def test_sparse_checkpoint_restore_rebuilds_active_state(self):
+        source = self.build_layer(stage2_enabled=True)
+        source.runtime["default"].curr_count = 2
+        source.coefficient["default"].data[:2] = torch.tensor([0.25, -0.5])
+        source.coefficient_indices["default"][:2] = torch.tensor([1, 7], dtype=torch.long)
+        exported = source.export_sparse_checkpoint("default")
+
+        restored = self.build_layer(stage2_enabled=True)
+        restored.runtime["default"].phase = "stage2"
+        restored.runtime["default"].current_step = 2
+        restored.runtime["default"].update_rounds = 4
+        restored.candidate_indices["default"] = torch.tensor([2, 3], dtype=torch.long)
+        restored.grad_cache["default"] = torch.ones(2)
+        restored.grad_count["default"] = 2
+        restored.last_promoted_slot_positions["default"] = torch.tensor([0], dtype=torch.long)
+        restored.last_promoted_flat_indices["default"] = torch.tensor([1], dtype=torch.long)
+
+        restored.restore_sparse_checkpoint("default", exported["coefficient"], exported["coefficient_indices"])
+
+        self.assertEqual(restored.runtime["default"].curr_count, 2)
+        self.assertEqual(restored.runtime["default"].phase, "stage1")
+        self.assertEqual(restored.runtime["default"].current_step, 0)
+        self.assertEqual(restored.runtime["default"].update_rounds, 0)
+        self.assertTrue(torch.equal(restored.coefficient_indices["default"][:2], torch.tensor([1, 7], dtype=torch.long)))
+        self.assertTrue(torch.allclose(restored.coefficient["default"][:2], torch.tensor([0.25, -0.5])))
+        self.assertTrue(bool(restored.elite_bitset["default"][1].item()))
+        self.assertTrue(bool(restored.elite_bitset["default"][7].item()))
+        self.assertEqual(restored.candidate_indices["default"].numel(), 0)
+        self.assertIsNone(restored.grad_cache["default"])
+        self.assertEqual(restored.grad_count["default"], 0)
+        self.assertNotIn("default", restored.last_promoted_slot_positions)
+        self.assertNotIn("default", restored.last_promoted_flat_indices)
+
 
 if __name__ == "__main__":
     unittest.main()

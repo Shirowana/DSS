@@ -107,7 +107,7 @@ def load_data(args: argparse.Namespace) -> list[dict]:
     file_path = Path(args.data_dir) / args.dataset / "test.json"
     if not file_path.exists():
         raise FileNotFoundError(f"Cannot find dataset file: {file_path}")
-    print(f"[eval] loading dataset: {file_path}")
+    print(f"[eval] loading dataset: {file_path}", flush=True)
     with file_path.open("r", encoding="utf-8") as handle:
         return json.load(handle)
 
@@ -135,22 +135,22 @@ def load_model(args: argparse.Namespace) -> tuple[AutoTokenizer, torch.nn.Module
     if args.adapter_path:
         model = PeftModel.from_pretrained(model, args.adapter_path)
         dss_layers_before = count_dss_layers(model)
-        print(f"[eval] loaded adapter: {args.adapter_path}")
-        print(f"[eval] DSS layers before merge: {dss_layers_before}")
+        print(f"[eval] loaded adapter: {args.adapter_path}", flush=True)
+        print(f"[eval] DSS layers before merge: {dss_layers_before}", flush=True)
         merge_debug_summary = None
         if args.debug_eval:
             merge_debug_summary = collect_merge_debug_summary(model)
             print_merge_debug_summary(merge_debug_summary)
-        print("[eval] merging DSS adapter into base weights...")
+        print("[eval] merging DSS adapter into base weights...", flush=True)
         model = model.merge_and_unload()
-        print(f"[eval] DSS layers after merge: {count_dss_layers(model)}")
+        print(f"[eval] DSS layers after merge: {count_dss_layers(model)}", flush=True)
         if args.debug_eval and merge_debug_summary is not None:
             validate_merged_weights(model, merge_debug_summary)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model.to(device)
     model.eval()
-    print(f"[eval] model.config.use_cache={model.config.use_cache}")
+    print(f"[eval] model.config.use_cache={model.config.use_cache}", flush=True)
     return tokenizer, model
 
 
@@ -194,6 +194,22 @@ def tensor_abs_max(tensor: torch.Tensor) -> float:
 def find_module_by_suffix(model: torch.nn.Module, suffix: str) -> tuple[str, torch.nn.Module] | tuple[None, None]:
     for name, module in model.named_modules():
         if name == suffix or name.endswith(f".{suffix}"):
+            return name, module
+    return None, None
+
+
+def find_merge_target_module(model: torch.nn.Module, suffix: str) -> tuple[str, torch.nn.Module] | tuple[None, None]:
+    candidates = [suffix]
+    for prefix in ("base_model.model.model.", "base_model.model.", "model."):
+        if suffix.startswith(prefix):
+            candidates.append(suffix[len(prefix) :])
+    seen: set[str] = set()
+    for candidate in candidates:
+        if candidate in seen:
+            continue
+        seen.add(candidate)
+        name, module = find_module_by_suffix(model, candidate)
+        if module is not None:
             return name, module
     return None, None
 
@@ -248,6 +264,8 @@ def collect_merge_debug_summary(model: torch.nn.Module) -> dict[str, object]:
         layer_summaries.append(
             {
                 "name": name,
+                "module_type": module.__class__.__name__,
+                "base_layer_type": module.get_base_layer().__class__.__name__ if hasattr(module, "get_base_layer") else None,
                 "curr_count": curr_count,
                 "coefficient_abs_max": tensor_abs_max(coeff),
                 "coefficient_rms": tensor_rms(coeff),
@@ -289,11 +307,13 @@ def print_merge_debug_summary(summary: dict[str, object]) -> None:
         f"max_active_slots={summary['max_active_slots']} "
         f"global_coefficient_abs_max={summary['global_coefficient_abs_max']:.4e} "
         f"global_coefficient_rms={summary['global_coefficient_rms']:.4e}"
-    )
+    , flush=True)
     for layer in summary["layers"]:
         print(
             "[eval-debug][adapter-layer] "
             f"name={layer['name']} "
+            f"module_type={layer['module_type']} "
+            f"base_layer_type={layer['base_layer_type']} "
             f"curr_count={layer['curr_count']} "
             f"coefficient_abs_max={layer['coefficient_abs_max']:.4e} "
             f"coefficient_rms={layer['coefficient_rms']:.4e} "
@@ -302,15 +322,14 @@ def print_merge_debug_summary(summary: dict[str, object]) -> None:
             f"base_abs_max={layer['base_abs_max']:.4e} "
             f"base_rms={layer['base_rms']:.4e} "
             f"delta_over_base_rms={layer['delta_over_base_rms']:.4e}"
-        )
+        , flush=True)
 
 
 def validate_merged_weights(model: torch.nn.Module, summary: dict[str, object]) -> None:
     for layer in summary["layers"]:
         suffix = str(layer["name"])
-        _name, merged_module = find_module_by_suffix(model, suffix)
+        merged_name, merged_module = find_merge_target_module(model, suffix)
         if merged_module is None or not hasattr(merged_module, "weight"):
-            print(f"[eval-debug][merge-check] missing merged module for {suffix}")
             continue
         merged_weight = merged_module.weight.detach().float()
         premerge_weight = layer["premerge_weight"]
@@ -322,7 +341,7 @@ def validate_merged_weights(model: torch.nn.Module, summary: dict[str, object]) 
             f"merged_diff_rms={tensor_rms(diff):.4e} "
             f"delta_abs_max={layer['delta_abs_max']:.4e} "
             f"delta_rms={layer['delta_rms']:.4e}"
-        )
+        , flush=True)
 
 
 def main() -> None:
@@ -428,12 +447,12 @@ def main() -> None:
                     f"gold_norm={label!r} "
                     f"effective_answer={predict!r} "
                     f"raw_token_len={raw_token_len}"
-                )
-                print(f"[eval-debug][instruction] {item.get('instruction', '')}")
-                print(f"[eval-debug][raw_output] {output}")
+                , flush=True)
+                print(f"[eval-debug][instruction] {item.get('instruction', '')}", flush=True)
+                print(f"[eval-debug][raw_output] {output}", flush=True)
 
         accuracy = correct / max(seen, 1)
-        print(f"  {batch_idx + 1}/{len(batches)} | accuracy: {correct}/{seen} = {accuracy:.4f}")
+        print(f"  {batch_idx + 1}/{len(batches)} | accuracy: {correct}/{seen} = {accuracy:.4f}", flush=True)
 
         with save_file.open("w", encoding="utf-8") as handle:
             json.dump(output_data, handle, indent=4, ensure_ascii=False)
@@ -454,9 +473,9 @@ def main() -> None:
             f"fraction_empty_raw_output={raw_empty_fraction:.4f} "
             f"fraction_extract_answer_empty={empty_fraction:.4f} "
             f"fraction_keyword_present={keyword_fraction:.4f}"
-        )
-    print(f"\nFinal accuracy: {correct}/{seen} = {final_accuracy:.4f}")
-    print(f"Saved predictions to {save_file}")
+        , flush=True)
+    print(f"\nFinal accuracy: {correct}/{seen} = {final_accuracy:.4f}", flush=True)
+    print(f"Saved predictions to {save_file}", flush=True)
 
 
 if __name__ == "__main__":

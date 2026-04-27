@@ -233,6 +233,69 @@ class DSSLayer(BaseTunerLayer):
         self.grad_count[adapter_name] = 0
         self.candidate_grad_sums[adapter_name] = None
         self.candidate_grad_sq_sums[adapter_name] = None
+
+    @torch.no_grad()
+    def export_sparse_checkpoint(self, adapter_name: str) -> dict[str, torch.Tensor]:
+        runtime = self.runtime[adapter_name]
+        curr_count = runtime.curr_count
+        return {
+            "coefficient": self.coefficient[adapter_name][:curr_count].detach().cpu().clone(),
+            "coefficient_indices": self.coefficient_indices[adapter_name][:curr_count].detach().cpu().clone(),
+        }
+
+    @torch.no_grad()
+    def restore_sparse_checkpoint(
+        self,
+        adapter_name: str,
+        coefficient_values: torch.Tensor,
+        coefficient_indices: torch.Tensor,
+    ) -> None:
+        coefficient_values = coefficient_values.reshape(-1).to(dtype=torch.float32)
+        coefficient_indices = coefficient_indices.reshape(-1).to(dtype=torch.long)
+        if coefficient_values.numel() != coefficient_indices.numel():
+            raise ValueError(
+                f"Sparse checkpoint for adapter {adapter_name!r} has mismatched values/indices lengths: "
+                f"{coefficient_values.numel()} vs {coefficient_indices.numel()}."
+            )
+
+        coeff_param = self.coefficient[adapter_name]
+        index_buffer = self.coefficient_indices[adapter_name]
+        max_slots = coeff_param.numel()
+        curr_count = int(coefficient_values.numel())
+        if curr_count > max_slots:
+            raise ValueError(
+                f"Sparse checkpoint for adapter {adapter_name!r} has {curr_count} active slots, "
+                f"but layer capacity is only {max_slots}."
+            )
+
+        coeff_param.data.zero_()
+        index_buffer.zero_()
+        if curr_count > 0:
+            coeff_param.data[:curr_count].copy_(coefficient_values.to(device=coeff_param.device, dtype=coeff_param.dtype))
+            index_buffer[:curr_count].copy_(coefficient_indices.to(device=index_buffer.device, dtype=index_buffer.dtype))
+
+        elite_bitset = self.elite_bitset[adapter_name]
+        elite_bitset.zero_()
+        if curr_count > 0:
+            elite_bitset[index_buffer[:curr_count].long()] = True
+
+        runtime = self.runtime[adapter_name]
+        runtime.phase = "stage1"
+        runtime.curr_count = curr_count
+        runtime.steady_phase = 0
+        runtime.current_step = 0
+        runtime.update_rounds = 0
+        runtime.update_flag = False
+        runtime.stage2_start_step = -1
+
+        if adapter_name in self.search_quantile_estimator:
+            self.search_quantile_estimator[adapter_name].reset()
+        self.clear_candidate_state(adapter_name)
+        self.last_promoted_slot_positions.pop(adapter_name, None)
+        self.last_promoted_flat_indices.pop(adapter_name, None)
+        self.last_health_stats.pop(adapter_name, None)
+        self.health_forward_calls[adapter_name] = 0
+
     #生成一批新的 candidate，并初始化它们的统计缓存
     def refresh_candidate_batch(self, adapter_name: str) -> None:
         hparams = self.hparams[adapter_name]
