@@ -3,9 +3,11 @@ from __future__ import annotations
 import warnings
 from dataclasses import asdict
 from enum import Enum
+from math import log
 from typing import Optional
 
 import torch
+import torch.nn as nn
 from tqdm import tqdm
 from transformers.pytorch_utils import Conv1D
 
@@ -34,6 +36,52 @@ class DSSModel(BaseTuner):
             low_cpu_mem_usage=low_cpu_mem_usage,
             state_dict=state_dict,
         )
+
+    @staticmethod
+    def _group_scale_key(adapter_name: str, basis_group_name: str) -> str:
+        return f"{adapter_name}__{basis_group_name}"
+
+    def _get_or_create_group_scale_log(
+        self,
+        adapter_name: str,
+        basis_group_name: str,
+        device: Optional[torch.device] = None,
+    ) -> nn.Parameter:
+        if "group_scale_log" not in self.__dict__.get("_modules", {}):
+            self.group_scale_log = nn.ParameterDict()
+        key = self._group_scale_key(adapter_name, basis_group_name)
+        if key not in self.group_scale_log:
+            init = float(self.peft_config[adapter_name].group_scale_init)
+            parameter = nn.Parameter(torch.tensor(log(init), dtype=torch.float32, device=device))
+            self.group_scale_log[key] = parameter
+        return self.group_scale_log[key]
+
+    def export_group_scale_state(self, adapter_name: str) -> dict[str, torch.Tensor]:
+        exported: dict[str, torch.Tensor] = {}
+        for basis_group_name in self.peft_config[adapter_name].basis_group_map.keys():
+            key = self._group_scale_key(adapter_name, basis_group_name)
+            if key in self.group_scale_log:
+                exported[basis_group_name] = self.group_scale_log[key].detach().cpu().clone()
+        return exported
+
+    @torch.no_grad()
+    def restore_group_scale_state(
+        self,
+        adapter_name: str,
+        state: dict[str, torch.Tensor],
+    ) -> None:
+        target_device = None
+        for _module_name, layer, layer_adapter_name in self.active_dss_layers():
+            if layer_adapter_name == adapter_name:
+                target_device = layer.get_base_layer().weight.device
+                break
+        for basis_group_name, value in state.items():
+            parameter = self._get_or_create_group_scale_log(
+                adapter_name,
+                basis_group_name,
+                device=target_device,
+            )
+            parameter.copy_(value.to(device=parameter.device, dtype=parameter.dtype))
 
     def _check_new_adapter_config(self, config: DSSConfig) -> None:
         if (len(self.peft_config) > 1) and (config.bias != "none"):
@@ -86,6 +134,11 @@ class DSSModel(BaseTuner):
             "update_margin": dss_config.update_margin,
             "basis_group_name": basis_group_name,
             "shared_basis": shared_basis,
+            "group_scale_log": self._get_or_create_group_scale_log(
+                adapter_name,
+                basis_group_name,
+                device=target.get_base_layer().weight.device if isinstance(target, BaseTunerLayer) else target.weight.device,
+            ),
             "module_name": current_key,
             "fan_in_fan_out": dss_config.fan_in_fan_out,
             "bias": bias,
@@ -106,6 +159,11 @@ class DSSModel(BaseTuner):
                 update_margin=dss_config.update_margin,
                 basis_group_name=basis_group_name,
                 shared_basis=shared_basis,
+                group_scale_log=self._get_or_create_group_scale_log(
+                    adapter_name,
+                    basis_group_name,
+                    device=target.get_base_layer().weight.device,
+                ),
                 module_name=current_key,
             )
         else:
@@ -139,6 +197,8 @@ class DSSModel(BaseTuner):
     def _mark_only_adapters_as_trainable(self, model: torch.nn.Module) -> None:
         for parameter in model.parameters():
             parameter.requires_grad = False
+        for parameter in self.group_scale_log.parameters():
+            parameter.requires_grad = False
 
         for module in model.modules():
             if not isinstance(module, DSSLayer):
@@ -146,6 +206,11 @@ class DSSModel(BaseTuner):
             for active_adapter in module.active_adapters:
                 if active_adapter in module.coefficient:
                     module.coefficient[active_adapter].requires_grad_(True)
+        for active_adapter in self.active_adapters:
+            for basis_group_name in self.peft_config[active_adapter].basis_group_map.keys():
+                key = self._group_scale_key(active_adapter, basis_group_name)
+                if key in self.group_scale_log:
+                    self.group_scale_log[key].requires_grad_(True)
 
         for active_adapter in self.active_adapters:
             bias = self.peft_config[active_adapter].bias

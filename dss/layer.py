@@ -99,12 +99,6 @@ class GPUQuantileEstimator:
 
 
 class DSSLayer(BaseTunerLayer):
-    DEFAULT_HEALTH_LOG_SUFFIXES = (
-        "layers.0.self_attn.q_proj",
-        "layers.0.self_attn.k_proj",
-        "layers.0.self_attn.v_proj",
-    )
-
     adapter_layer_names = ("coefficient",)
     other_param_names = (
         "coefficient_indices",
@@ -122,19 +116,16 @@ class DSSLayer(BaseTunerLayer):
         self.elite_bitset = BufferDict({})
         self.basis_A_inv = BufferDict({})
         self.basis_B_inv = BufferDict({})
+        self.group_scale_log_param: dict[str, nn.Parameter] = {}
         self._disable_adapters = False
         self.merged_adapters = []
         self.kwargs = kwargs
         self.quantile_lr = 0.01
         self.quantile_alpha = 0.0
+        self.quantile_mode = os.environ.get("DSS_QUANTILE_MODE", "sgd").strip().lower()
+        if self.quantile_mode not in {"sgd", "oracle"}:
+            raise ValueError(f"Unsupported DSS quantile mode: {self.quantile_mode!r}. Use 'sgd' or 'oracle'.")
         self.delta_scale = float(os.environ.get("DSS_DELTA_SCALE", "1.0"))
-        self.health_log_enabled = os.environ.get("DSS_HEALTH_LOG_ENABLED", "1") not in {"0", "false", "False"}
-        self.health_log_every = max(1, int(os.environ.get("DSS_HEALTH_LOG_EVERY", "500")))
-        suffixes = os.environ.get("DSS_HEALTH_LOG_MODULE_SUFFIXES")
-        if suffixes:
-            self.health_log_suffixes = tuple(suffix.strip() for suffix in suffixes.split(",") if suffix.strip())
-        else:
-            self.health_log_suffixes = self.DEFAULT_HEALTH_LOG_SUFFIXES
 
         self.runtime: dict[str, AdapterRuntime] = {}
         self.hparams: dict[str, AdapterHyperParams] = {}
@@ -147,8 +138,6 @@ class DSSLayer(BaseTunerLayer):
         self.last_promoted_flat_indices: dict[str, torch.Tensor] = {}
         self.basis_group_name: dict[str, str] = {}
         self.module_name: dict[str, str] = {}
-        self.health_forward_calls: dict[str, int] = {}
-        self.last_health_stats: dict[str, dict[str, float | int | str]] = {}
 
         base_layer = self.get_base_layer()
         if isinstance(base_layer, nn.Linear):
@@ -166,64 +155,8 @@ class DSSLayer(BaseTunerLayer):
     def _adapter_label(self, adapter_name: str) -> str:
         return str(adapter_name)
 
-    def _should_emit_health_log(self, adapter_name: str) -> bool:
-        if not self.health_log_enabled:
-            return False
-        module_name = self.module_name.get(adapter_name, "")
-        if self.health_log_suffixes and not any(module_name.endswith(suffix) for suffix in self.health_log_suffixes):
-            return False
-        calls = self.health_forward_calls.get(adapter_name, 0) + 1
-        self.health_forward_calls[adapter_name] = calls
-        return calls % self.health_log_every == 0
-
-    def _emit_health_log(
-        self,
-        adapter_name: str,
-        result: torch.Tensor,
-        y_core: torch.Tensor,
-        y_delta: torch.Tensor,
-    ) -> None:
-        runtime = self.runtime[adapter_name]
-        if runtime.curr_count <= 0:
-            return
-        coeff = self.coefficient[adapter_name][: runtime.curr_count].detach().float()
-        base_abs_max = result.detach().float().abs().max().item() if result.numel() > 0 else 0.0
-        y_core_abs_max = y_core.detach().float().abs().max().item() if y_core.numel() > 0 else 0.0
-        y_delta_abs_max = y_delta.detach().float().abs().max().item() if y_delta.numel() > 0 else 0.0
-        delta_abs_max = abs(self.delta_scale) * y_delta_abs_max
-        coeff_abs_max = coeff.abs().max().item() if coeff.numel() > 0 else 0.0
-        coeff_rms = coeff.square().mean().sqrt().item() if coeff.numel() > 0 else 0.0
-        ratio = delta_abs_max / max(base_abs_max, 1e-12)
-        stats = {
-            "module": self.module_name.get(adapter_name, "<unknown>"),
-            "group": self.basis_group_name.get(adapter_name, "unknown"),
-            "forward_calls": self.health_forward_calls.get(adapter_name, 0),
-            "active_slots": runtime.curr_count,
-            "base_abs_max": base_abs_max,
-            "delta_abs_max": delta_abs_max,
-            "delta_base_ratio": ratio,
-            "coeff_abs_max": coeff_abs_max,
-            "coeff_rms": coeff_rms,
-            "y_core_abs_max": y_core_abs_max,
-            "y_delta_abs_max": y_delta_abs_max,
-        }
-        self.last_health_stats[adapter_name] = stats
-        print(
-            "[dss-health] "
-            f"module={stats['module']} "
-            f"group={stats['group']} "
-            f"adapter={adapter_name} "
-            f"forward_calls={stats['forward_calls']} "
-            f"active_slots={stats['active_slots']} "
-            f"base_abs_max={base_abs_max:.4e} "
-            f"delta_abs_max={delta_abs_max:.4e} "
-            f"delta_base_ratio={ratio:.4e} "
-            f"coeff_abs_max={coeff_abs_max:.4e} "
-            f"coeff_rms={coeff_rms:.4e} "
-            f"y_core_abs_max={y_core_abs_max:.4e} "
-            f"y_delta_abs_max={y_delta_abs_max:.4e}",
-            flush=True,
-        )
+    def _group_scale(self, adapter_name: str, dtype: torch.dtype) -> torch.Tensor:
+        return self.group_scale_log_param[adapter_name].exp().to(dtype=dtype)
 
     #把候选池全部清空
     def clear_candidate_state(self, adapter_name: str) -> None:
@@ -293,8 +226,6 @@ class DSSLayer(BaseTunerLayer):
         self.clear_candidate_state(adapter_name)
         self.last_promoted_slot_positions.pop(adapter_name, None)
         self.last_promoted_flat_indices.pop(adapter_name, None)
-        self.last_health_stats.pop(adapter_name, None)
-        self.health_forward_calls[adapter_name] = 0
 
     #生成一批新的 candidate，并初始化它们的统计缓存
     def refresh_candidate_batch(self, adapter_name: str) -> None:
@@ -368,6 +299,11 @@ class DSSLayer(BaseTunerLayer):
             return
         candidates_data = x_mean.reshape(-1).float()
         search_estimator = self.search_quantile_estimator[adapter_name]
+        if self.quantile_mode == "oracle":
+            if candidates_data.max() > 0:
+                search_estimator.quantile.data.fill_(torch.quantile(candidates_data, search_estimator.q))
+            return
+
         if search_estimator.quantile.item() == 0.0 and candidates_data.max() > 0:
             init_val = torch.quantile(candidates_data, search_estimator.q)
             search_estimator.quantile.data.fill_(init_val)
@@ -392,12 +328,15 @@ class DSSLayer(BaseTunerLayer):
         num_candidates = int(candidate_mask.sum().item())
 
         if num_candidates > real_up:
-            return torch.argsort(x_mean.float(), descending=True)[:real_up]
-        if num_candidates < real_low:
+            selected = torch.argsort(x_mean.float(), descending=True)[:real_up]
+        elif num_candidates < real_low:
             if real_low == 0:
-                return torch.empty(0, device=x_mean.device, dtype=torch.long)
-            return torch.argsort(x_mean.float(), descending=True)[:real_low]
-        return torch.nonzero(candidate_mask, as_tuple=True)[0]
+                selected = torch.empty(0, device=x_mean.device, dtype=torch.long)
+            else:
+                selected = torch.argsort(x_mean.float(), descending=True)[:real_low]
+        else:
+            selected = torch.nonzero(candidate_mask, as_tuple=True)[0]
+        return selected
 
     #算出当前这一轮，prune/grow的个数与具体位置
     def select_stage2_slots(
@@ -743,6 +682,7 @@ class DSSLayer(BaseTunerLayer):
         flat_indices = self.coefficient_indices[adapter_name][:curr_count]
         A_inv = self.basis_A_inv[adapter_name]
         B_inv = self.basis_B_inv[adapter_name]
+        group_scale = self._group_scale(adapter_name, A_inv.dtype)
 
         if slot_values.numel() == 0:
             return torch.zeros(
@@ -756,7 +696,8 @@ class DSSLayer(BaseTunerLayer):
         cols = flat_indices.remainder(B_inv.shape[1])
         A_cols = A_inv[:, rows]
         B_rows = B_inv[cols, :]
-        return torch.einsum("k,ok,ki->oi", slot_values.to(dtype=A_inv.dtype), A_cols, B_rows)
+        delta_weight = torch.einsum("k,ok,ki->oi", slot_values.to(dtype=A_inv.dtype), A_cols, B_rows)
+        return group_scale * delta_weight
         '''目前这个方法已经节省了大部分开销，无法避免的是生成一张完整的 dense delta_weight
         ，然后如果放在训练前向里，还要再做一次 x @ delta_w.T'''
 
@@ -786,6 +727,7 @@ class DSSLinear(nn.Module, DSSLayer):
 
         basis_group_name: str,
         shared_basis: SharedBasisEntry,
+        group_scale_log: nn.Parameter,
 
         fan_in_fan_out: bool = False,
         module_name: Optional[str] = None,
@@ -810,6 +752,7 @@ class DSSLinear(nn.Module, DSSLayer):
             update_margin=update_margin,
             basis_group_name=basis_group_name,
             shared_basis=shared_basis,
+            group_scale_log=group_scale_log,
             module_name=module_name,
         )
 
@@ -829,6 +772,7 @@ class DSSLinear(nn.Module, DSSLayer):
         update_margin: float,
         basis_group_name: str,
         shared_basis: SharedBasisEntry,
+        group_scale_log: nn.Parameter,
         module_name: Optional[str] = None,
     ) -> None:
         core_shape = tuple(shared_basis.shape)
@@ -855,9 +799,9 @@ class DSSLinear(nn.Module, DSSLayer):
         self.elite_bitset[adapter_name] = torch.zeros(self.out_features * self.in_features, device=device, dtype=torch.bool)
         self.basis_A_inv[adapter_name] = shared_basis.A_inv.to(device=device, dtype=torch.float32)
         self.basis_B_inv[adapter_name] = shared_basis.B_inv.to(device=device, dtype=torch.float32)
+        self.group_scale_log_param[adapter_name] = group_scale_log
         self.basis_group_name[adapter_name] = basis_group_name
         self.module_name[adapter_name] = module_name or ""
-        self.health_forward_calls[adapter_name] = 0
 
         self.hparams[adapter_name] = AdapterHyperParams(
             grad_store_steps=grad_store_steps,
@@ -936,6 +880,7 @@ class DSSLinear(nn.Module, DSSLayer):
 
             B_inv = self.basis_B_inv[active_adapter]
             A_inv = self.basis_A_inv[active_adapter]
+            group_scale = self._group_scale(active_adapter, A_inv.dtype)
             x_basis = torch.matmul(self._cast_input_dtype(x, B_inv.dtype), B_inv.transpose(0, 1))
             #根据当前阶段决定是否收集 candidate probe
             if runtime.phase == "stage1":
@@ -959,8 +904,7 @@ class DSSLinear(nn.Module, DSSLayer):
 
             y_core = F.linear(x_basis, lambda_dense)
             y_delta = torch.matmul(y_core, A_inv.transpose(0, 1))
-            if self._should_emit_health_log(active_adapter):
-                self._emit_health_log(active_adapter, result, y_core, y_delta)
+            y_delta = group_scale * y_delta
             result = result + (self.delta_scale * y_delta).to(dtype=result.dtype)
             '''
             base:   y_base = base_layer(x)

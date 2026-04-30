@@ -52,28 +52,45 @@ def diagonalization(
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=max_iters)
     for iter_idx in range(max_iters):
         optimizer.zero_grad(set_to_none=True)
-        A_norm = A / A.norm().clamp_min(1e-12)
-        B_norm = B / B.norm().clamp_min(1e-12)
+        A_eff = A / A.norm().clamp_min(1e-12)
+        B_eff = B / B.norm().clamp_min(1e-12)
         total_loss = torch.zeros((), device=device, dtype=dtype)
+        total_diag_norm = torch.zeros((), device=device, dtype=dtype)
+        total_off_diag_norm = torch.zeros((), device=device, dtype=dtype)
         for weight, weight_norm in zip(weights, weight_norms):
             normalized_weight = weight / weight_norm
-            transformed = A_norm @ normalized_weight @ B_norm
+            transformed = A_eff @ normalized_weight @ B_eff
             diag = transformed.masked_fill(~mask, 0)
             off_diag = transformed.masked_fill(mask, 0)
-            total_loss = total_loss + off_diag.norm() ** 2 / diag.norm().clamp_min(1e-12) ** 2
+            diag_norm = diag.norm().clamp_min(1e-12)
+            off_diag_norm = off_diag.norm()
+            total_loss = total_loss + off_diag_norm ** 2 / diag_norm ** 2
+            total_diag_norm = total_diag_norm + diag_norm
+            total_off_diag_norm = total_off_diag_norm + off_diag_norm
         total_loss.backward()
         optimizer.step()
         scheduler.step()
+        avg_diag_norm = total_diag_norm / max(len(weights), 1)
+        avg_off_diag_norm = total_off_diag_norm / max(len(weights), 1)
+        avg_ratio = avg_off_diag_norm / avg_diag_norm.clamp_min(1e-12)
+        print(
+            f"[basis-fit] iter={iter_idx + 1:04d}/{max_iters} "
+            f"loss={float(total_loss.detach().item()):.6e} "
+            f"avg_off_over_diag={float(avg_ratio.detach().item()):.6e} "
+            f"avg_diag_norm={float(avg_diag_norm.detach().item()):.6e} "
+            f"avg_off_diag_norm={float(avg_off_diag_norm.detach().item()):.6e} "
+            f"lr={float(scheduler.get_last_lr()[0]):.6e}"
+        )
 
     A = (A / A.norm().clamp_min(1e-12)).detach()
     B = (B / B.norm().clamp_min(1e-12)).detach()
     return A, B
 
-
+    #Lambda = A W B
 def to_core_space(weight: Tensor, A: Tensor, B: Tensor) -> Tensor:
     return A @ weight @ B
 
-
+    #W = A_inv Lambda B_inv
 def from_core_space(core: Tensor, A_inv: Tensor, B_inv: Tensor) -> Tensor:
     return A_inv @ core @ B_inv
 

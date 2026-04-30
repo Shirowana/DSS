@@ -27,6 +27,10 @@ class DSSConfig(PeftConfig):
         default_factory=_default_basis_group_map,
         metadata={"help": "Mapping from basis group names to target-module suffix aliases."},
     )
+    group_scale_init: float = field(
+        default=1.0,
+        metadata={"help": "Initial positive scale c_g used in DeltaW = c_g * A_inv * DeltaLambda * B_inv."},
+    )
     n_frequency: int = field(
         default=8,
         metadata={"help": "Total elite-slot budget per adapted layer. This is the final size of the trainable elite pool after stage-1 fill completes."},
@@ -148,6 +152,8 @@ class DSSConfig(PeftConfig):
 
         if not isinstance(self.basis_group_map, dict) or not self.basis_group_map:
             raise ValueError("`basis_group_map` must be a non-empty dictionary.")
+        if self.group_scale_init <= 0:
+            raise ValueError("`group_scale_init` must be strictly positive.")
         normalized_group_map: dict[str, list[str]] = {}
         for group_name, aliases in self.basis_group_map.items():
             if not isinstance(group_name, str) or not group_name:

@@ -80,6 +80,11 @@ def _collect_dss_sparse_state_dict(model, adapter_name: str) -> dict[str, torch.
         exported = export_fn(adapter_name)
         sparse_state_dict[f"{module_name}.coefficient"] = exported["coefficient"]
         sparse_state_dict[f"{module_name}.coefficient_indices"] = exported["coefficient_indices"]
+    tuner = getattr(model, "base_model", None)
+    export_group_scale_state = getattr(tuner, "export_group_scale_state", None)
+    if callable(export_group_scale_state):
+        for group_name, tensor in export_group_scale_state(adapter_name).items():
+            sparse_state_dict[f"base_model.group_scale_log.{group_name}"] = tensor
     return sparse_state_dict
 
 
@@ -102,15 +107,27 @@ def _restore_dss_sparse_state_dict(
     adapter_name: str,
 ) -> dict[str, torch.Tensor]:
     grouped_state: dict[str, dict[str, torch.Tensor]] = {}
+    group_scale_state: dict[str, torch.Tensor] = {}
     passthrough_state: dict[str, torch.Tensor] = {}
 
     for key, tensor in state_dict.items():
+        if key.startswith("base_model.group_scale_log."):
+            group_name = key.removeprefix("base_model.group_scale_log.")
+            group_scale_state[group_name] = tensor
+            continue
         matched = _match_dss_sparse_key(key, adapter_name)
         if matched is None:
             passthrough_state[key] = tensor
             continue
         module_name, field_name = matched
         grouped_state.setdefault(module_name, {})[field_name] = tensor
+
+    if group_scale_state:
+        tuner = getattr(model, "base_model", None)
+        restore_group_scale_state = getattr(tuner, "restore_group_scale_state", None)
+        if not callable(restore_group_scale_state):
+            raise ValueError("This DSS model does not support restoring saved group scale parameters.")
+        restore_group_scale_state(adapter_name, group_scale_state)
 
     for module_name, payload in grouped_state.items():
         if "coefficient" not in payload or "coefficient_indices" not in payload:

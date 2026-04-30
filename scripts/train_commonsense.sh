@@ -22,7 +22,22 @@ TIMESTAMP=${TIMESTAMP:-$(date +"%Y%m%d_%H%M%S")}
 
 MODEL_NAME=${MODEL_NAME:-"Llama3-8B"}
 MODEL_CACHE_DIR=${MODEL_CACHE_DIR:-"${REMOTE_MODEL_ROOT}"}
-MODEL_PATH=${MODEL_PATH:-"${REMOTE_MODEL_ROOT}/${MODEL_NAME}"}
+if [[ -z "${MODEL_PATH:-}" ]]; then
+    case "${MODEL_NAME}" in
+        "Llama3-8B")
+            MODEL_PATH="${REMOTE_MODEL_ROOT}/Meta-Llama-3-8B"
+            ;;
+        "Llama2-7B")
+            MODEL_PATH="${REMOTE_MODEL_ROOT}/Llama-2-7b-hf"
+            ;;
+        "Llama2-13B")
+            MODEL_PATH="${REMOTE_MODEL_ROOT}/Llama-2-13b-hf"
+            ;;
+        *)
+            MODEL_PATH="${REMOTE_MODEL_ROOT}/${MODEL_NAME}"
+            ;;
+    esac
+fi
 
 DATA_DIR=${DATA_DIR:-"${REMOTE_DATA_ROOT}/commonsense_new"}
 MAX_LENGTH=${MAX_LENGTH:-256}
@@ -55,11 +70,21 @@ NUM_WORKERS=${NUM_WORKERS:-0}
 REPORT_TO=${REPORT_TO:-"none"}
 EXPERIMENT_RECORD_ENABLED=${EXPERIMENT_RECORD_ENABLED:-1}
 EXPERIMENT_MD=${EXPERIMENT_MD:-}
-DSS_HEALTH_LOG_ENABLED=${DSS_HEALTH_LOG_ENABLED:-1}
-DSS_HEALTH_LOG_EVERY=${DSS_HEALTH_LOG_EVERY:-500}
-DSS_HEALTH_LOG_MODULE_SUFFIXES=${DSS_HEALTH_LOG_MODULE_SUFFIXES:-"layers.0.self_attn.q_proj,layers.0.self_attn.k_proj,layers.0.self_attn.v_proj"}
+DSS_QUANTILE_MODE=${DSS_QUANTILE_MODE:-"sgd"}
+BASIS_MODE=${BASIS_MODE:-"shared"}
 
-SHARED_BASIS_PATH=${SHARED_BASIS_PATH:-"${REMOTE_PROJECT_ROOT}/basis/llama3_8b_dss_basis_identity_fro.pt"}
+if [[ "${BASIS_MODE}" != "shared" && "${BASIS_MODE}" != "identity" ]]; then
+    echo "Unsupported BASIS_MODE=${BASIS_MODE}. Use shared or identity."
+    exit 1
+fi
+
+if [[ -z "${SHARED_BASIS_PATH:-}" ]]; then
+    if [[ "${BASIS_MODE}" == "identity" ]]; then
+        SHARED_BASIS_PATH="${REMOTE_PROJECT_ROOT}/basis/llama3_8b_dss_basis_identity_ablation.pt"
+    else
+        SHARED_BASIS_PATH="${REMOTE_PROJECT_ROOT}/basis/llama3_8b_dss_basis_identity_fro.pt"
+    fi
+fi
 BASIS_OFFSET=${BASIS_OFFSET:-0}
 BASIS_LR=${BASIS_LR:-0.01}
 BASIS_ITERS=${BASIS_ITERS:-1000}
@@ -70,7 +95,7 @@ FIT_BASIS=${FIT_BASIS:-"auto"}
 RUN_NAME=${RUN_NAME:-"commonsense_${MODEL_NAME}_dss_nf${N_FREQUENCY}_cand${CANDIDATE_SIZE}_gs${GRAD_STORE_STEPS}_${TIMESTAMP}"}
 OUTPUT_DIR=${OUTPUT_DIR:-"${OUTPUT_ROOT}/${RUN_NAME}"}
 LOG_FILE=${LOG_FILE:-"${LOG_ROOT}/${TIMESTAMP}.log"}
-SHARED_BASIS_SCRIPT=${SHARED_BASIS_SCRIPT:-"${REMOTE_PEFT_SRC}/peft/tuners/dss/shared_basis.py"}
+SHARED_BASIS_SCRIPT=${SHARED_BASIS_SCRIPT:-"${REMOTE_PROJECT_ROOT}/fit_shared_basis.py"}
 
 format_elapsed() {
     local total_seconds=$1
@@ -93,9 +118,7 @@ conda activate quest
 export PYTHONPATH="${REMOTE_PEFT_SRC}:${REMOTE_PROJECT_ROOT}:${PYTHONPATH:-}"
 export WANDB_PROJECT=${WANDB_PROJECT:-"dss_commonsense"}
 export WANDB_NAME=${WANDB_NAME:-"${RUN_NAME}"}
-export DSS_HEALTH_LOG_ENABLED
-export DSS_HEALTH_LOG_EVERY
-export DSS_HEALTH_LOG_MODULE_SUFFIXES
+export DSS_QUANTILE_MODE
 
 mkdir -p "${LOG_ROOT}" "${OUTPUT_ROOT}" "${RESULT_ROOT}" "${OUTPUT_DIR}" "${EXPERIMENT_ROOT}"
 cd "${REMOTE_PROJECT_ROOT}"
@@ -103,6 +126,7 @@ cd "${REMOTE_PROJECT_ROOT}"
 echo "MODEL_PATH=${MODEL_PATH}"
 echo "DATASET_PATH=${DATASET_PATH}"
 echo "SHARED_BASIS_PATH=${SHARED_BASIS_PATH}"
+echo "BASIS_MODE=${BASIS_MODE}"
 echo "OUTPUT_DIR=${OUTPUT_DIR}"
 echo "LOG_FILE=${LOG_FILE}"
 echo "REPORT_TO=${REPORT_TO}"
@@ -111,9 +135,7 @@ echo "EXPERIMENT_ROOT=${EXPERIMENT_ROOT}"
 if [[ -n "${EXPERIMENT_MD}" ]]; then
     echo "EXPERIMENT_MD=${EXPERIMENT_MD}"
 fi
-echo "DSS_HEALTH_LOG_ENABLED=${DSS_HEALTH_LOG_ENABLED}"
-echo "DSS_HEALTH_LOG_EVERY=${DSS_HEALTH_LOG_EVERY}"
-echo "DSS_HEALTH_LOG_MODULE_SUFFIXES=${DSS_HEALTH_LOG_MODULE_SUFFIXES}"
+echo "DSS_QUANTILE_MODE=${DSS_QUANTILE_MODE}"
 
 if [[ "${FIT_BASIS}" == "1" || ! -f "${SHARED_BASIS_PATH}" ]]; then
     if [[ ! -f "${SHARED_BASIS_SCRIPT}" ]]; then
@@ -133,6 +155,7 @@ if [[ "${FIT_BASIS}" == "1" || ! -f "${SHARED_BASIS_PATH}" ]]; then
         --model_cache_dir "${MODEL_CACHE_DIR}"
         --output_path "${SHARED_BASIS_PATH}"
         --target_modules "${TARGET_MODULES}"
+        --basis_mode "${BASIS_MODE}"
         --basis_offset "${BASIS_OFFSET}"
         --basis_lr "${BASIS_LR}"
         --basis_iters "${BASIS_ITERS}"
