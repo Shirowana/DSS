@@ -23,7 +23,7 @@ INDEX_COLUMNS = [
     "date",
     "model",
     "target_modules",
-    "basis",
+    "mode",
     "lr",
     "scheduler",
     "warmup_steps",
@@ -52,7 +52,7 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Create or update a commonsense experiment record.")
     parser.add_argument("--log_file", required=True)
     parser.add_argument("--output_dir", required=True)
-    parser.add_argument("--experiment_root", default="/data/home/7250091/date/DSS/experiments/commonsense")
+    parser.add_argument("--experiment_root", default="/root/code/DSS/experiments/commonsense")
     parser.add_argument("--experiment_md", default=None)
     return parser.parse_args()
 
@@ -69,6 +69,9 @@ def parse_log(log_file: Path) -> dict:
     lines = text.splitlines()
     progress_re = re.compile(
         r"\|\s*(?P<step>\d+)/(?:\s*)?(?P<total>\d+).*?loss=(?P<loss>[-+0-9.eE]+), lr=(?P<lr>[-+0-9.eE]+)"
+    )
+    trainer_log_re = re.compile(
+        r"\{'loss': (?P<loss>[-+0-9.eE]+), .*?'learning_rate': (?P<lr>[-+0-9.eE]+), 'epoch': (?P<epoch>[-+0-9.eE]+)\}"
     )
     health_re = re.compile(
         r"\[dss-health\].*?group=(?P<group>\S+).*?"
@@ -95,6 +98,10 @@ def parse_log(log_file: Path) -> dict:
             summary["total_steps"] = match.group("total")
             summary["final_loss"] = match.group("loss")
             summary["final_lr"] = match.group("lr")
+        trainer_match = trainer_log_re.search(line)
+        if trainer_match:
+            summary["final_loss"] = trainer_match.group("loss")
+            summary["final_lr"] = trainer_match.group("lr")
         health = health_re.search(line)
         if health:
             group = health.group("group")
@@ -142,19 +149,22 @@ def build_markdown(
     config_rows = [
         ["model", format_value(training_args.get("model_name"))],
         ["target_modules", format_value(training_args.get("target_modules"))],
-        ["shared_basis_path", format_value(training_args.get("shared_basis_path"))],
+        ["mode", "dss_no_basis_stage1_only"],
         ["n_frequency", format_value(training_args.get("n_frequency"))],
         ["candidate_size", format_value(training_args.get("candidate_size"))],
         ["grad_store_steps", format_value(training_args.get("grad_store_steps"))],
+        ["threshold_mode", format_value(training_args.get("threshold_mode"))],
+        ["dropout", format_value(training_args.get("dropout"))],
         ["lr", format_value(training_args.get("lr"))],
         ["scheduler", format_value(training_args.get("scheduler"))],
         ["warmup_steps", format_value(training_args.get("warmup_steps"))],
         ["num_epochs", format_value(training_args.get("num_epochs"))],
         ["max_steps", format_value(training_args.get("max_steps"))],
-        ["stage2_enabled", format_value(training_args.get("stage2_enabled"))],
-        ["steady_stage_ratio", format_value(training_args.get("steady_stage_ratio"))],
-        ["update_interval", format_value(training_args.get("update_interval"))],
-        ["update_counts", format_value(training_args.get("update_counts"))],
+        ["val_set_size", format_value(training_args.get("val_set_size"))],
+        ["eval_steps", format_value(training_args.get("eval_steps"))],
+        ["save_steps", format_value(training_args.get("save_steps"))],
+        ["load_best_model_at_end", format_value(training_args.get("load_best_model_at_end"))],
+        ["resume_from_checkpoint", format_value(training_args.get("resume_from_checkpoint"))],
     ]
     result_rows = [
         ["steps", format_value(log_summary.get("steps") or log_summary.get("total_steps"))],
@@ -273,7 +283,7 @@ def main() -> None:
         "date": run_name[-15:] if re.search(r"\d{8}_\d{6}$", run_name) else "",
         "model": format_value(training_args.get("model_name")),
         "target_modules": format_value(training_args.get("target_modules")),
-        "basis": Path(format_value(training_args.get("shared_basis_path"))).name,
+        "mode": "dss_no_basis_stage1_only",
         "lr": format_value(training_args.get("lr")),
         "scheduler": format_value(training_args.get("scheduler")),
         "warmup_steps": format_value(training_args.get("warmup_steps")),

@@ -6,8 +6,8 @@
 #
 # Optional environment overrides:
 #   MODEL_NAME=Llama3-8B
-#   MODEL_PATH=/data/home/7250091/date/hf_cache_models/models/Meta-Llama-3-8B
-#   DATA_DIR=/data/home/7250091/date/datasets/evaluate
+#   MODEL_PATH=/root/hf_cache_models/models/Meta-Llama-3-8B
+#   DATA_DIR=/root/datasets/evaluate
 #   PRECISION=bf16
 #   BATCH_SIZE=1
 #   MAX_NEW_TOKENS=32
@@ -22,10 +22,10 @@ set -euo pipefail
 ADAPTER_PATH=${1:?"Usage: bash scripts/eval_commonsense.sh <adapter_path> [dataset|all] [output_dir]"}
 DATASET_ARG=${2:-all}
 
-REMOTE_PROJECT_ROOT=${REMOTE_PROJECT_ROOT:-"/data/home/7250091/date/DSS"}
-REMOTE_PEFT_SRC=${REMOTE_PEFT_SRC:-"/data/home/7250091/date/quest20260313/peft/src"}
-REMOTE_DATA_ROOT=${REMOTE_DATA_ROOT:-"/data/home/7250091/date/datasets"}
-REMOTE_MODEL_ROOT=${REMOTE_MODEL_ROOT:-"/data/home/7250091/date/hf_cache_models/models"}
+REMOTE_PROJECT_ROOT=${REMOTE_PROJECT_ROOT:-"/root/code/DSS"}
+REMOTE_PEFT_SRC=${REMOTE_PEFT_SRC:-"/root/code/quest/peft/src"}
+REMOTE_DATA_ROOT=${REMOTE_DATA_ROOT:-"/root/datasets"}
+REMOTE_MODEL_ROOT=${REMOTE_MODEL_ROOT:-"/root/hf_cache_models/models"}
 LOG_ROOT=${LOG_ROOT:-"${REMOTE_PROJECT_ROOT}/logs_commonsense"}
 RESULT_ROOT=${RESULT_ROOT:-"${REMOTE_PROJECT_ROOT}/results_commonsense"}
 EXPERIMENT_ROOT=${EXPERIMENT_ROOT:-"${REMOTE_PROJECT_ROOT}/experiments/commonsense"}

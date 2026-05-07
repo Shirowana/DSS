@@ -1,481 +1,232 @@
 """
-Evaluate a DSS PEFT adapter on commonsense reasoning benchmarks.
+Evaluate DiaBlo model on commonsense reasoning benchmarks.
 
-The script follows the DiaBlo commonsense evaluation format:
-load ``dataset_commonsense/{dataset}/test.json``, generate short answers, extract
-the option token with dataset-specific regex rules, and save per-example results.
+Supported datasets: boolq, piqa, social_i_qa, hellaswag, winogrande, ARC-Challenge, ARC-Easy, openbookqa
 
-Example:
-    python evaluate_commonsense.py \
-        --model_name Llama3-8B \
-        --dataset boolq \
-        --adapter_path /data/home/7250091/date/DSS/output/... \
-        --data_dir /data/home/7250091/date/datasets/evaluate \
-        --output_dir /data/home/7250091/date/DSS/results_commonsense/...
+Usage:
+    python evaluate_commonsense.py --model_name Llama2-7B --dataset boolq \
+        --adapter_path results/.../adapter.chkpt --output_dir eval_results/
 """
 
-from __future__ import annotations
-
-import argparse
 import copy
-from datetime import datetime
 import json
-import math
 import os
 import re
-import sys
-from pathlib import Path
+import argparse
 
 import torch
 from tqdm import tqdm
-from transformers import AutoModelForCausalLM, AutoTokenizer, GenerationConfig
+from transformers import GenerationConfig, AutoModelForCausalLM, AutoTokenizer
 
-try:
-    from peft import PeftModel
-except ImportError as exc:  # pragma: no cover
-    raise RuntimeError("This script requires `peft` to load DSS adapters.") from exc
+from diablo import replace_linear_with_blocklinear
 
+device = "cuda" if torch.cuda.is_available() else "cpu"
 
-ROOT = Path(__file__).resolve().parent
-if str(ROOT) not in sys.path:
-    sys.path.insert(0, str(ROOT))
+parser = argparse.ArgumentParser()
+parser.add_argument("--dataset", required=True,
+                     choices=["boolq", "piqa", "social_i_qa", "hellaswag", "winogrande", "ARC-Challenge", "ARC-Easy", "openbookqa"])
+parser.add_argument("--model_name", type=str, default="Llama2-7B")
+parser.add_argument("--adapter_path", type=str, default=None, help="Path to adapter.chkpt (None for zero-shot)")
+parser.add_argument("--output_dir", type=str, required=True)
+parser.add_argument("--data_dir", type=str, default="./datasets", help="Dataset directory")
+parser.add_argument("--batch_size", type=int, default=4)
+parser.add_argument("--num_blocks", type=int, default=64)
+parser.add_argument("--target_modules", type=str, default="qkvud")
+parser.add_argument("--precision", type=str, default="bf16", choices=["fp32", "fp16", "bf16"])
+parser.add_argument("--model_cache_dir", type=str, default=None)
+parser.add_argument("--hf_token", type=str, default=None)
+args = parser.parse_args()
 
-import peft.tuners.dss  # noqa: F401,E402 - importing registers the DSS PEFT method
+# Setup
+hf_token = args.hf_token or os.environ.get("HF_TOKEN")
+if hf_token:
+    from huggingface_hub import login
+    login(hf_token)
 
-
-SUPPORTED_DATASETS = [
-    "boolq",
-    "piqa",
-    "social_i_qa",
-    "hellaswag",
-    "winogrande",
-    "ARC-Challenge",
-    "ARC-Easy",
-    "openbookqa",
-]
-
-REMOTE_PROJECT_ROOT = Path("/data/home/7250091/date/DSS")
-REMOTE_DATA_ROOT = Path("/data/home/7250091/date/datasets")
-REMOTE_MODEL_ROOT = Path("/data/home/7250091/date/hf_cache_models/models")
-REMOTE_RESULTS_ROOT = REMOTE_PROJECT_ROOT / "results_commonsense"
+model_dir = args.model_cache_dir or os.environ.get("MODEL_CACHE_DIR", None)
 
 MODEL_MAP = {
-    "Llama2-7B": str(REMOTE_MODEL_ROOT / "Llama2-7B"),
-    "Llama2-13B": str(REMOTE_MODEL_ROOT / "Llama2-13B"),
-    "Llama3-8B": str(REMOTE_MODEL_ROOT / "Llama3-8B"),
-    "Llama3-3B": str(REMOTE_MODEL_ROOT / "Llama3-3B"),
-    "Mistral-7B": str(REMOTE_MODEL_ROOT / "Mistral-7B"),
-    "Qwen2.5-7B": str(REMOTE_MODEL_ROOT / "Qwen2.5-7B"),
+    "Llama2-7B": "/data/home/7250091/date/hf_cache_models/models/Llama-2-7b-hf",
+    "Llama2-13B": "meta-llama/Llama-2-13b-hf",
+    "Llama3-8B": "/data/home/7250091/date/hf_cache_models/models/Meta-Llama-3-8B",
+    "Llama3-3B": "meta-llama/Llama-3.2-3B",
 }
+load_name = MODEL_MAP[args.model_name]
+
+if args.precision == "bf16":
+    load_precision = torch.bfloat16
+elif args.precision == "fp16":
+    load_precision = torch.float32
+else:
+    load_precision = torch.float32
+
+compute_precision = torch.bfloat16 if args.precision == "bf16" else torch.float16
+
+MODULE_MAP = {"q": "q_proj", "k": "k_proj", "v": "v_proj", "u": "up_proj", "d": "down_proj", "o": "o_proj", "g": "gate_proj"}
+target_modules_list = [MODULE_MAP[c] for c in args.target_modules if c in MODULE_MAP]
 
 
-def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Evaluate DSS on commonsense reasoning benchmarks.")
-    parser.add_argument("--dataset", required=True, choices=SUPPORTED_DATASETS)
-    parser.add_argument("--model_name", type=str, default="Llama3-8B", choices=sorted(MODEL_MAP))
-    parser.add_argument("--model_path", type=str, default=None, help="Explicit local model directory; overrides --model_name.")
-    parser.add_argument("--adapter_path", type=str, default=None, help="DSS adapter directory. Omit for base-model zero-shot.")
-    parser.add_argument("--output_dir", type=str, default=None)
-    parser.add_argument("--run_name", type=str, default=None)
-    parser.add_argument("--data_dir", type=str, default=str(REMOTE_DATA_ROOT / "evaluate"))
-    parser.add_argument("--batch_size", type=int, default=1)
-    parser.add_argument("--precision", type=str, default="bf16", choices=["fp32", "fp16", "bf16"])
-    parser.add_argument("--model_cache_dir", type=str, default=str(REMOTE_MODEL_ROOT))
-    parser.add_argument("--hf_token", type=str, default=None)
-    parser.add_argument("--max_new_tokens", type=int, default=32)
-    parser.add_argument("--num_beams", type=int, default=4)
-    parser.add_argument("--debug_eval", action="store_true", help="Enable low-noise evaluation debug logging.")
-    parser.add_argument("--debug_first_n", type=int, default=5, help="Always print debug details for the first N examples.")
-    parser.add_argument("--debug_print_failures", action="store_true", default=True, help="Print debug details for failed examples.")
-    parser.add_argument("--debug_max_failures", type=int, default=20, help="Maximum number of failed examples to print.")
-    return parser.parse_args()
+def generate_prompt(instruction, input=None):
+    if input:
+        return f"""Below is an instruction that describes a task, paired with an input that provides further context. Write a response that appropriately completes the request.
+
+### Instruction:
+{instruction}
+
+### Input:
+{input}
+
+### Response:
+"""
+    else:
+        return f"""Below is an instruction that describes a task. Write a response that appropriately completes the request.
+
+### Instruction:
+{instruction}
+
+### Response:
+"""
 
 
-def resolve_dtype(precision: str) -> torch.dtype:
-    if precision == "bf16":
-        return torch.bfloat16
-    if precision == "fp16":
-        return torch.float16
-    return torch.float32
-
-
-def generate_prompt(instruction: str, input_text: str | None = None) -> str:
-    return f"{instruction}\n"
-
-
-def load_data(args: argparse.Namespace) -> list[dict]:
-    file_path = Path(args.data_dir) / args.dataset / "test.json"
-    if not file_path.exists():
+def load_data():
+    file_path = os.path.join(args.data_dir, f"{args.dataset}/test.json")
+    if not os.path.exists(file_path):
         raise FileNotFoundError(f"Cannot find dataset file: {file_path}")
-    print(f"[eval] loading dataset: {file_path}", flush=True)
-    with file_path.open("r", encoding="utf-8") as handle:
-        return json.load(handle)
+    return json.load(open(file_path, "r"))
 
 
-def load_model(args: argparse.Namespace) -> tuple[AutoTokenizer, torch.nn.Module]:
-    hf_token = args.hf_token or os.environ.get("HF_TOKEN")
-    if hf_token:
-        from huggingface_hub import login
-
-        login(hf_token)
-
-    model_dir = args.model_cache_dir or os.environ.get("MODEL_CACHE_DIR")
-    model_id = args.model_path or MODEL_MAP[args.model_name]
-    torch_dtype = resolve_dtype(args.precision)
-
-    tokenizer = AutoTokenizer.from_pretrained(model_id, cache_dir=model_dir)
+def load_model():
+    tokenizer = AutoTokenizer.from_pretrained(load_name, cache_dir=model_dir)
     tokenizer.padding_side = "left"
-    if tokenizer.pad_token_id is None:
-        tokenizer.pad_token = tokenizer.eos_token
+    tokenizer.pad_token_id = 0
 
-    model = AutoModelForCausalLM.from_pretrained(model_id, cache_dir=model_dir, torch_dtype=torch_dtype)
-    model.config.pad_token_id = tokenizer.pad_token_id
-    model.config.use_cache = True
+    model = AutoModelForCausalLM.from_pretrained(load_name, cache_dir=model_dir, torch_dtype=load_precision)
+
+    if args.num_blocks > 0:
+        replace_linear_with_blocklinear(
+            model.model,
+            num_blocks=args.num_blocks,
+            target_modules=target_modules_list,
+        )
 
     if args.adapter_path:
-        model = PeftModel.from_pretrained(model, args.adapter_path)
-        dss_layers_before = count_dss_layers(model)
-        print(f"[eval] loaded adapter: {args.adapter_path}", flush=True)
-        print(f"[eval] DSS layers before merge: {dss_layers_before}", flush=True)
-        merge_debug_summary = None
-        if args.debug_eval:
-            merge_debug_summary = collect_merge_debug_summary(model)
-            print_merge_debug_summary(merge_debug_summary)
-        print("[eval] merging DSS adapter into base weights...", flush=True)
-        model = model.merge_and_unload()
-        print(f"[eval] DSS layers after merge: {count_dss_layers(model)}", flush=True)
-        if args.debug_eval and merge_debug_summary is not None:
-            validate_merged_weights(model, merge_debug_summary)
+        D = torch.load(args.adapter_path, map_location="cpu")
+        # Remove score parameters if present in old checkpoints
+        D = {k: v for k, v in D.items() if "scores" not in k}
+        model.load_state_dict(D, strict=False)
 
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model.to(device)
-    model.eval()
-    print(f"[eval] model.config.use_cache={model.config.use_cache}", flush=True)
+    model.to(compute_precision).to(device)
     return tokenizer, model
 
+'''
+def extract_answer(sentence: str) -> str:
+    sentence_ = sentence.strip()
+    if args.dataset == "boolq":
+        pred = re.findall(r"true|false", sentence_)
+    elif args.dataset == "piqa":
+        pred = re.findall(r"solution1|solution2", sentence_)
+    elif args.dataset in ["social_i_qa", "ARC-Challenge", "ARC-Easy", "openbookqa"]:
+        pred = re.findall(r"answer1|answer2|answer3|answer4|answer5", sentence_)
+    elif args.dataset == "hellaswag":
+        pred = re.findall(r"ending1|ending2|ending3|ending4", sentence_)
+    elif args.dataset == "winogrande":
+        pred = re.findall(r"option1|option2", sentence_)
+    else:
+        pred = []
+    return pred[0] if pred else ""
+'''
 
-def count_dss_layers(model: torch.nn.Module) -> int:
-    return sum(1 for module in model.modules() if module.__class__.__name__ in {"DSSLayer", "DSSLinear"})
-
-
-def normalize_label(dataset: str, text: str | None) -> str:
+def normalize_label(text: str) -> str:
+    """
+    把 gold label / 模型输出统一归一化：
+    - BoolQ: true / false
+    - 其他多选题: solution1 / answer1 / option1 / ending1 -> choice1
+    """
     if text is None:
         return ""
-    sentence = text.strip().lower()
-    if dataset == "boolq":
-        if re.search(r"\btrue\b", sentence):
+    s = text.strip().lower()
+    # BoolQ
+    if args.dataset == "boolq":
+        if re.search(r"\btrue\b", s):
             return "true"
-        if re.search(r"\bfalse\b", sentence):
+        if re.search(r"\bfalse\b", s):
             return "false"
         return ""
+    # 通用多选：统一抽取编号
+    m = re.findall(r"\b(?:solution|answer|option|ending)\s*([1-5])\b", s)
+    if m:
+        return f"choice{m[-1]}"   # 取最后一个，避免前面残留干扰
 
-    matches = re.findall(r"\b(?:solution|answer|option|ending)\s*([1-5])\b", sentence)
-    if matches:
-        return f"choice{matches[-1]}"
     return ""
 
 
-def extract_answer(dataset: str, sentence: str) -> str:
-    return normalize_label(dataset, sentence)
+def extract_answer(sentence: str) -> str:
+    """
+    从模型生成文本中提取最终答案，并做归一化。
+    """
+    return normalize_label(sentence)
 
 
-def tensor_rms(tensor: torch.Tensor) -> float:
-    if tensor.numel() == 0:
-        return 0.0
-    return tensor.detach().float().square().mean().sqrt().item()
+def main():
+    dataset = load_data()
+    tokenizer, model = load_model()
+    model.eval()
 
-
-def tensor_abs_max(tensor: torch.Tensor) -> float:
-    if tensor.numel() == 0:
-        return 0.0
-    return tensor.detach().float().abs().max().item()
-
-
-def find_module_by_suffix(model: torch.nn.Module, suffix: str) -> tuple[str, torch.nn.Module] | tuple[None, None]:
-    for name, module in model.named_modules():
-        if name == suffix or name.endswith(f".{suffix}"):
-            return name, module
-    return None, None
-
-
-def find_merge_target_module(model: torch.nn.Module, suffix: str) -> tuple[str, torch.nn.Module] | tuple[None, None]:
-    candidates = [suffix]
-    for prefix in ("base_model.model.model.", "base_model.model.", "model."):
-        if suffix.startswith(prefix):
-            candidates.append(suffix[len(prefix) :])
-    seen: set[str] = set()
-    for candidate in candidates:
-        if candidate in seen:
-            continue
-        seen.add(candidate)
-        name, module = find_module_by_suffix(model, candidate)
-        if module is not None:
-            return name, module
-    return None, None
-
-
-def adapter_keyword_present(dataset: str, text: str) -> bool:
-    sentence = text.strip().lower()
-    if dataset == "boolq":
-        return bool(re.search(r"\btrue\b|\bfalse\b", sentence))
-    return bool(re.search(r"\b(?:solution|answer|option|ending)\s*[1-5]\b", sentence))
-
-
-def collect_merge_debug_summary(model: torch.nn.Module) -> dict[str, object]:
-    suffixes = (
-        "model.layers.0.self_attn.q_proj",
-        "model.layers.0.self_attn.k_proj",
-        "model.layers.0.self_attn.v_proj",
-    )
-    layer_summaries: list[dict[str, object]] = []
-    active_counts: list[int] = []
-    coeff_abs_max_values: list[float] = []
-    coeff_rms_values: list[float] = []
-
-    for _name, module in model.named_modules():
-        if module.__class__.__name__ not in {"DSSLayer", "DSSLinear"}:
-            continue
-        for adapter_name in getattr(module, "active_adapters", []):
-            if adapter_name not in getattr(module, "coefficient", {}):
-                continue
-            runtime = module.runtime[adapter_name]
-            curr_count = int(runtime.curr_count)
-            active_counts.append(curr_count)
-            if curr_count > 0:
-                coeff = module.coefficient[adapter_name][:curr_count]
-                coeff_abs_max_values.append(tensor_abs_max(coeff))
-                coeff_rms_values.append(tensor_rms(coeff))
-
-    for suffix in suffixes:
-        name, module = find_module_by_suffix(model, suffix)
-        if module is None or module.__class__.__name__ not in {"DSSLayer", "DSSLinear"}:
-            continue
-        adapter_names = [adapter for adapter in getattr(module, "active_adapters", []) if adapter in module.coefficient]
-        if not adapter_names:
-            continue
-        adapter_name = adapter_names[0]
-        runtime = module.runtime[adapter_name]
-        curr_count = int(runtime.curr_count)
-        coeff = module.coefficient[adapter_name][:curr_count]
-        delta_weight = module.get_delta_weight(adapter_name).detach().float()
-        base_weight = module.get_base_layer().weight.detach().float()
-        delta_rms = tensor_rms(delta_weight)
-        base_rms = tensor_rms(base_weight)
-        layer_summaries.append(
-            {
-                "name": name,
-                "module_type": module.__class__.__name__,
-                "base_layer_type": module.get_base_layer().__class__.__name__ if hasattr(module, "get_base_layer") else None,
-                "curr_count": curr_count,
-                "coefficient_abs_max": tensor_abs_max(coeff),
-                "coefficient_rms": tensor_rms(coeff),
-                "delta_abs_max": tensor_abs_max(delta_weight),
-                "delta_rms": delta_rms,
-                "base_abs_max": tensor_abs_max(base_weight),
-                "base_rms": base_rms,
-                "delta_over_base_rms": delta_rms / max(base_rms, 1e-12),
-                "premerge_weight": base_weight.detach().cpu().clone(),
-            }
-        )
-
-    num_layers = len(active_counts)
-    total_active_slots = int(sum(active_counts))
-    mean_active_slots = float(total_active_slots / num_layers) if num_layers else 0.0
-    max_active_slots = int(max(active_counts)) if active_counts else 0
-    global_coeff_abs_max = max(coeff_abs_max_values) if coeff_abs_max_values else 0.0
-    global_coeff_rms = math.sqrt(
-        sum(value * value for value in coeff_rms_values) / len(coeff_rms_values)
-    ) if coeff_rms_values else 0.0
-
-    return {
-        "num_dss_layers": num_layers,
-        "total_active_slots": total_active_slots,
-        "mean_active_slots": mean_active_slots,
-        "max_active_slots": max_active_slots,
-        "global_coefficient_abs_max": global_coeff_abs_max,
-        "global_coefficient_rms": global_coeff_rms,
-        "layers": layer_summaries,
-    }
-
-
-def print_merge_debug_summary(summary: dict[str, object]) -> None:
-    print(
-        "[eval-debug][adapter-summary] "
-        f"num_dss_layers={summary['num_dss_layers']} "
-        f"total_active_slots={summary['total_active_slots']} "
-        f"mean_active_slots={summary['mean_active_slots']:.2f} "
-        f"max_active_slots={summary['max_active_slots']} "
-        f"global_coefficient_abs_max={summary['global_coefficient_abs_max']:.4e} "
-        f"global_coefficient_rms={summary['global_coefficient_rms']:.4e}"
-    , flush=True)
-    for layer in summary["layers"]:
-        print(
-            "[eval-debug][adapter-layer] "
-            f"name={layer['name']} "
-            f"module_type={layer['module_type']} "
-            f"base_layer_type={layer['base_layer_type']} "
-            f"curr_count={layer['curr_count']} "
-            f"coefficient_abs_max={layer['coefficient_abs_max']:.4e} "
-            f"coefficient_rms={layer['coefficient_rms']:.4e} "
-            f"delta_abs_max={layer['delta_abs_max']:.4e} "
-            f"delta_rms={layer['delta_rms']:.4e} "
-            f"base_abs_max={layer['base_abs_max']:.4e} "
-            f"base_rms={layer['base_rms']:.4e} "
-            f"delta_over_base_rms={layer['delta_over_base_rms']:.4e}"
-        , flush=True)
-
-
-def validate_merged_weights(model: torch.nn.Module, summary: dict[str, object]) -> None:
-    for layer in summary["layers"]:
-        suffix = str(layer["name"])
-        merged_name, merged_module = find_merge_target_module(model, suffix)
-        if merged_module is None or not hasattr(merged_module, "weight"):
-            continue
-        merged_weight = merged_module.weight.detach().float()
-        premerge_weight = layer["premerge_weight"]
-        diff = merged_weight - premerge_weight
-        print(
-            "[eval-debug][merge-check] "
-            f"name={suffix} "
-            f"merged_diff_abs_max={tensor_abs_max(diff):.4e} "
-            f"merged_diff_rms={tensor_rms(diff):.4e} "
-            f"delta_abs_max={layer['delta_abs_max']:.4e} "
-            f"delta_rms={layer['delta_rms']:.4e}"
-        , flush=True)
-
-
-def main() -> None:
-    args = parse_args()
-    dataset = load_data(args)
-    tokenizer, model = load_model(args)
-    device = next(model.parameters()).device
-
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    adapter_name = Path(args.adapter_path).name if args.adapter_path else "base"
-    run_name = args.run_name or f"eval_commonsense_{args.model_name}_{adapter_name}_{timestamp}"
-    output_dir = Path(args.output_dir) if args.output_dir else REMOTE_RESULTS_ROOT / run_name
-    output_dir.mkdir(parents=True, exist_ok=True)
-    save_file = output_dir / f"{args.dataset}.json"
-
-    generation_config = GenerationConfig(
-        temperature=0.1,
-        top_p=0.75,
-        top_k=40,
-        num_beams=args.num_beams,
-        do_sample=False,
-        pad_token_id=tokenizer.pad_token_id,
-        eos_token_id=tokenizer.eos_token_id,
-        use_cache=True,
-    )
+    os.makedirs(args.output_dir, exist_ok=True)
+    save_file = os.path.join(args.output_dir, f"{args.dataset}.json")
 
     batches = [dataset[i : i + args.batch_size] for i in range(0, len(dataset), args.batch_size)]
+
     correct = 0
-    seen = 0
-    output_data: list[dict] = []
-    debug_failure_count = 0
-    generated_token_lengths: list[int] = []
-    hitting_max_new_tokens = 0
-    empty_raw_output_count = 0
-    empty_prediction_count = 0
-    keyword_present_count = 0
+    current = 0
+    output_data = []
 
-    def should_print_debug(example_index: int, flag: bool) -> bool:
-        nonlocal debug_failure_count
-        if not args.debug_eval:
-            return False
-        if example_index < args.debug_first_n:
-            return True
-        if args.debug_print_failures and not flag and debug_failure_count < args.debug_max_failures:
-            debug_failure_count += 1
-            return True
-        return False
+    for idx, batch in enumerate(tqdm(batches, desc=f"Evaluating {args.dataset}")):
+        current += len(batch)
+        instructions = [data.get("instruction") for data in batch]
+        prompts = [generate_prompt(inst) for inst in instructions]
+        inputs = tokenizer(prompts, return_tensors="pt", padding=True)
 
-    for batch_idx, batch in enumerate(tqdm(batches, desc=f"Evaluating {args.dataset}")):
-        instructions = [item.get("instruction", "") for item in batch]
-        prompts = [generate_prompt(instruction) for instruction in instructions]
-        tokenized = tokenizer(prompts, return_tensors="pt", padding=True)
-        tokenized = {key: value.to(device) for key, value in tokenized.items()}
-
-        with torch.inference_mode():
+        generation_config = GenerationConfig(
+            temperature=0.1, top_p=0.75, top_k=40, num_beams=4, do_sample=False
+        )
+        with torch.no_grad():
             generation_output = model.generate(
-                **tokenized,
+                input_ids=inputs["input_ids"].to(device),
+                attention_mask=inputs["attention_mask"].to(device),
                 generation_config=generation_config,
-                max_new_tokens=args.max_new_tokens,
+                return_dict_in_generate=True,
+                output_scores=True,
+                max_new_tokens=32,
             )
 
-        prompt_lens = tokenized["attention_mask"].sum(dim=1).tolist()
-        decoded = []
-        decoded_token_lengths = []
-        for seq, prompt_len in zip(generation_output, prompt_lens):
-            gen_ids = seq[int(prompt_len) :]
-            decoded_token_lengths.append(int(gen_ids.numel()))
-            decoded.append(tokenizer.decode(gen_ids, skip_special_tokens=True).strip())
+        sequences = generation_output.sequences
+        prompt_lens = inputs["attention_mask"].sum(dim=1).tolist()
 
-        for item, output, raw_token_len in zip(batch, decoded, decoded_token_lengths):
-            label_raw = item.get("answer")
-            label = normalize_label(args.dataset, label_raw)
-            predict = extract_answer(args.dataset, output)
-            flag = label == predict
-            correct += int(flag)
-            seen += 1
-            generated_token_lengths.append(raw_token_len)
-            hitting_max_new_tokens += int(raw_token_len >= args.max_new_tokens)
-            empty_raw_output_count += int(output.strip() == "")
-            empty_prediction_count += int(predict == "")
-            keyword_present_count += int(adapter_keyword_present(args.dataset, output))
+        outputs = []
+        for i, seq in enumerate(sequences):
+            gen_ids = seq[prompt_lens[i]:]
+            output = tokenizer.decode(gen_ids, skip_special_tokens=True).strip()
+            outputs.append(output)
+        for data, output in zip(batch, outputs):
+            label = normalize_label(data.get("answer"))
+            predict = extract_answer(output)
+            flag = (label == predict)
+            if flag:
+                correct += 1
 
-            row = copy.deepcopy(item)
-            row["output_pred"] = output
-            row["pred"] = predict
-            row["flag"] = flag
-            if args.debug_eval:
-                row["debug"] = {
-                    "gold_answer_raw": label_raw,
-                    "gold_answer_normalized": label,
-                    "raw_decoded_text": output,
-                    "effective_answer": predict,
-                    "raw_decoded_token_length": raw_token_len,
-                }
-            output_data.append(row)
+            new_data = copy.deepcopy(data)
+            new_data["output_pred"] = output
+            new_data["pred"] = predict
+            new_data["flag"] = flag
+            output_data.append(new_data)
 
-            if should_print_debug(seen - 1, flag):
-                print(
-                    "[eval-debug][sample] "
-                    f"index={seen - 1} "
-                    f"flag={flag} "
-                    f"gold_raw={json.dumps(label_raw, ensure_ascii=False)} "
-                    f"gold_norm={label!r} "
-                    f"effective_answer={predict!r} "
-                    f"raw_token_len={raw_token_len}"
-                , flush=True)
-                print(f"[eval-debug][instruction] {item.get('instruction', '')}", flush=True)
-                print(f"[eval-debug][raw_output] {output}", flush=True)
+        print(f"  {idx + 1}/{len(batches)} | accuracy: {correct}/{current} = {correct / current:.4f}")
+        with open(save_file, "w") as f:
+            json.dump(output_data, f, indent=4)
 
-        accuracy = correct / max(seen, 1)
-        print(f"  {batch_idx + 1}/{len(batches)} | accuracy: {correct}/{seen} = {accuracy:.4f}", flush=True)
 
-        with save_file.open("w", encoding="utf-8") as handle:
-            json.dump(output_data, handle, indent=4, ensure_ascii=False)
-
-    final_accuracy = correct / max(seen, 1)
-    with save_file.open("w", encoding="utf-8") as handle:
-        json.dump(output_data, handle, indent=4, ensure_ascii=False)
-    if args.debug_eval:
-        avg_generated_len = sum(generated_token_lengths) / max(len(generated_token_lengths), 1)
-        raw_empty_fraction = empty_raw_output_count / max(seen, 1)
-        empty_fraction = empty_prediction_count / max(seen, 1)
-        max_token_fraction = hitting_max_new_tokens / max(seen, 1)
-        keyword_fraction = keyword_present_count / max(seen, 1)
-        print(
-            "[eval-debug][generation-summary] "
-            f"average_generated_token_length={avg_generated_len:.2f} "
-            f"fraction_hitting_max_new_tokens={max_token_fraction:.4f} "
-            f"fraction_empty_raw_output={raw_empty_fraction:.4f} "
-            f"fraction_extract_answer_empty={empty_fraction:.4f} "
-            f"fraction_keyword_present={keyword_fraction:.4f}"
-        , flush=True)
-    print(f"\nFinal accuracy: {correct}/{seen} = {final_accuracy:.4f}", flush=True)
-    print(f"Saved predictions to {save_file}", flush=True)
+    print(f"\nFinal accuracy: {correct}/{current} = {correct / current:.4f}")
 
 
 if __name__ == "__main__":

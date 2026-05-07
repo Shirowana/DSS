@@ -5,15 +5,17 @@ Fine-tune Llama with DSS on the preprocessed commonsense dataset.
 from __future__ import annotations
 
 import argparse
+from contextlib import contextmanager
 from datetime import datetime
 import json
 import os
 from pathlib import Path
 
 import torch
-from datasets import load_from_disk
+from datasets import Dataset, DatasetDict, load_from_disk
+from packaging.version import Version
 from torch.nn.utils.rnn import pad_sequence
-from transformers import AutoModelForCausalLM, AutoTokenizer, TrainingArguments, set_seed
+from transformers import AutoModelForCausalLM, AutoTokenizer, Trainer, TrainingArguments, set_seed
 
 try:
     from peft import get_peft_model
@@ -21,21 +23,16 @@ except ImportError as exc:  # pragma: no cover
     raise RuntimeError("This script requires `peft` with DSS registration support.") from exc
 
 from peft.tuners.dss import DSSConfig  # noqa: F401 - importing peft.tuners.dss registers the PEFT method
-from trainer import DSSTrainer
 
 
-REMOTE_PROJECT_ROOT = Path("/data/home/7250091/date/DSS")
-REMOTE_DATA_ROOT = Path("/data/home/7250091/date/datasets")
-REMOTE_MODEL_ROOT = Path("/data/home/7250091/date/hf_cache_models/models")
+REMOTE_PROJECT_ROOT = Path("/root/code/DSS")
+REMOTE_DATA_ROOT = Path("/root/datasets")
+REMOTE_MODEL_ROOT = Path("/root/hf_cache_models/models")
 REMOTE_OUTPUT_ROOT = REMOTE_PROJECT_ROOT / "output"
 
 MODEL_MAP = {
-    "Llama2-7B": str(REMOTE_MODEL_ROOT / "Llama2-7B"),
-    "Llama2-13B": str(REMOTE_MODEL_ROOT / "Llama2-13B"),
-    "Llama3-8B": str(REMOTE_MODEL_ROOT / "Llama3-8B"),
-    "Llama3-3B": str(REMOTE_MODEL_ROOT / "Llama3-3B"),
-    "Mistral-7B": str(REMOTE_MODEL_ROOT / "Mistral-7B"),
-    "Qwen2.5-7B": str(REMOTE_MODEL_ROOT / "Qwen2.5-7B"),
+    "Llama2-7B": str(REMOTE_MODEL_ROOT / "Llama-2-7b-hf"),
+    "Llama3-8B": str(REMOTE_MODEL_ROOT / "Meta-Llama-3-8B"),
 }
 
 MODULE_MAP = {
@@ -59,20 +56,19 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--data_dir", type=str, default=str(REMOTE_DATA_ROOT / "commonsense_new"))
     parser.add_argument("--dataset_path", type=str, default=None, help="Full HuggingFace disk dataset path; overrides --data_dir.")
     parser.add_argument("--max_length", type=int, default=512)
-    parser.add_argument("--shared_basis_path", type=str, required=True)
+    parser.add_argument("--val_set_size", type=int, default=0)
 
     parser.add_argument("--target_modules", type=str, default="qkvud")
     parser.add_argument("--n_frequency", type=int, default=8)
     parser.add_argument("--candidate_size", type=int, default=32)
     parser.add_argument("--grad_store_steps", type=int, default=10)
-    parser.add_argument("--low", type=int, default=1)
-    parser.add_argument("--up", type=int, default=4)
+    parser.add_argument("--low", type=float, default=1.0)
+    parser.add_argument("--up", type=float, default=4.0)
     parser.add_argument("--ratio", type=float, default=0.1)
-    parser.add_argument("--stage2_enabled", action="store_true")
-    parser.add_argument("--steady_stage_ratio", type=float, default=0.0)
-    parser.add_argument("--update_interval", type=int, default=100)
-    parser.add_argument("--update_counts", type=int, default=1)
-    parser.add_argument("--update_margin", type=float, default=0.0)
+    parser.add_argument("--threshold_mode", type=str, default="oracle", choices=["oracle", "sgd"])
+    parser.add_argument("--dropout", type=float, default=0.0)
+    parser.add_argument("--quantile_lr", type=float, default=0.01)
+    parser.add_argument("--quantile_alpha", type=float, default=0.0)
 
     parser.add_argument("--lr", type=float, default=5e-4)
     parser.add_argument("--batch_size", type=int, default=4)
@@ -90,6 +86,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--run_name", type=str, default=None)
     parser.add_argument("--save_steps", type=int, default=0)
     parser.add_argument("--save_total_limit", type=int, default=3)
+    parser.add_argument("--eval_steps", type=int, default=0)
+    parser.add_argument("--load_best_model_at_end", action="store_true")
+    parser.add_argument("--resume_from_checkpoint", type=str, default=None)
     parser.add_argument("--logging_steps", type=int, default=100)
     parser.add_argument("--report_to", type=str, default="none")
     parser.add_argument("--seed", type=int, default=42)
@@ -118,9 +117,66 @@ def count_parameters(model) -> tuple[int, int]:
     return total, trainable
 
 
+def resolve_train_dataset(dataset_obj) -> Dataset:
+    if isinstance(dataset_obj, Dataset):
+        return dataset_obj
+    if isinstance(dataset_obj, DatasetDict):
+        if "train" not in dataset_obj:
+            raise ValueError("DatasetDict must contain a `train` split.")
+        return dataset_obj["train"]
+    if hasattr(dataset_obj, "keys") and "train" in dataset_obj:
+        return dataset_obj["train"]
+    raise ValueError(f"Unsupported dataset object loaded from disk: {type(dataset_obj)!r}")
+
+
+def torch_supports_safe_checkpoint_resume() -> bool:
+    version = torch.__version__.split("+", 1)[0]
+    return Version(version) >= Version("2.6.0")
+
+
+@contextmanager
+def maybe_hide_unsafe_resume_state(checkpoint_dir: str | None):
+    if not checkpoint_dir or torch_supports_safe_checkpoint_resume():
+        yield
+        return
+
+    checkpoint_path = Path(checkpoint_dir)
+    hidden_paths: list[tuple[Path, Path]] = []
+    for filename in ("optimizer.pt", "scheduler.pt"):
+        original = checkpoint_path / filename
+        if not original.exists():
+            continue
+        hidden = checkpoint_path / f"{filename}.unsafe-hidden"
+        if hidden.exists():
+            hidden.unlink()
+        original.rename(hidden)
+        hidden_paths.append((original, hidden))
+
+    try:
+        yield
+    finally:
+        for original, hidden in hidden_paths:
+            if hidden.exists():
+                hidden.rename(original)
+
+
 def main() -> None:
     args = parse_args()
     set_seed(args.seed)
+
+    if torch.cuda.is_available() and torch.cuda.device_count() > 1:
+        raise ValueError(
+            "The current DSS no-basis stage1 implementation keeps layer-local runtime state and is not "
+            "safe under multi-GPU DataParallel/replicated training yet. Please expose a single GPU, for example "
+            "with `CUDA_VISIBLE_DEVICES=0`."
+        )
+
+    if args.val_set_size < 0:
+        raise ValueError("`--val_set_size` must be non-negative.")
+    if args.load_best_model_at_end and args.val_set_size <= 0:
+        raise ValueError("`--load_best_model_at_end` requires `--val_set_size > 0`.")
+    if args.val_set_size > 0 and args.eval_steps <= 0:
+        raise ValueError("`--eval_steps` must be positive when using a validation split.")
 
     model_dir = args.model_cache_dir or os.environ.get("MODEL_CACHE_DIR")
     torch_dtype = resolve_precision(args.precision)
@@ -144,7 +200,6 @@ def main() -> None:
         raise ValueError("`--target_modules` did not resolve to any known module names.")
 
     dss_config = DSSConfig(
-        shared_basis_path=args.shared_basis_path,
         target_modules=target_modules,
         n_frequency=args.n_frequency,
         candidate_size=args.candidate_size,
@@ -152,11 +207,10 @@ def main() -> None:
         low=args.low,
         up=args.up,
         ratio=args.ratio,
-        stage2_enabled=args.stage2_enabled,
-        steady_stage_ratio=args.steady_stage_ratio,
-        update_interval=args.update_interval,
-        update_counts=args.update_counts,
-        update_margin=args.update_margin,
+        threshold_mode=args.threshold_mode,
+        dropout=args.dropout,
+        quantile_lr=args.quantile_lr,
+        quantile_alpha=args.quantile_alpha,
         bias="none",
     )
     model = get_peft_model(model, dss_config)
@@ -172,7 +226,19 @@ def main() -> None:
         dataset_path = Path(args.dataset_path)
     else:
         dataset_path = Path(args.data_dir) / f"train_all_{args.max_length}_OnlyOutput_{args.model_name}"
-    train_dataset = load_from_disk(str(dataset_path))
+    full_train_dataset = resolve_train_dataset(load_from_disk(str(dataset_path)))
+
+    if args.val_set_size > 0:
+        if args.val_set_size >= len(full_train_dataset):
+            raise ValueError(
+                f"`--val_set_size` ({args.val_set_size}) must be smaller than the dataset size ({len(full_train_dataset)})."
+            )
+        split = full_train_dataset.train_test_split(test_size=args.val_set_size, shuffle=True, seed=args.seed)
+        train_dataset = split["train"]
+        eval_dataset = split["test"]
+    else:
+        train_dataset = full_train_dataset
+        eval_dataset = None
 
     def collate_fn(batch):
         input_ids = [torch.as_tensor(item["input_ids"], dtype=torch.long) for item in batch]
@@ -193,39 +259,60 @@ def main() -> None:
     with (output_dir / "training_args.json").open("w", encoding="utf-8") as handle:
         json.dump(vars(args), handle, indent=2, ensure_ascii=False)
 
+    has_eval = eval_dataset is not None
+    eval_strategy = "steps" if has_eval else "no"
+    save_strategy = "steps" if (args.save_steps > 0 or has_eval) else "no"
+    resolved_eval_steps = max(args.eval_steps, 1) if has_eval else None
+    resolved_save_steps = max(args.save_steps, 1) if args.save_steps > 0 else (resolved_eval_steps or 1)
+
     training_args = TrainingArguments(
         output_dir=str(output_dir),
         num_train_epochs=args.num_epochs,
         max_steps=args.max_steps,
         per_device_train_batch_size=args.batch_size,
+        per_device_eval_batch_size=args.batch_size,
         gradient_accumulation_steps=args.gradient_accumulation_steps,
         learning_rate=args.lr,
         lr_scheduler_type=args.scheduler,
         warmup_steps=args.warmup_steps,
         weight_decay=args.weight_decay,
         logging_steps=args.logging_steps,
-        save_strategy="steps" if args.save_steps > 0 else "no",
-        save_steps=max(args.save_steps, 1),
+        eval_strategy=eval_strategy,
+        eval_steps=resolved_eval_steps,
+        save_strategy=save_strategy,
+        save_steps=resolved_save_steps,
         save_total_limit=args.save_total_limit,
+        load_best_model_at_end=args.load_best_model_at_end,
+        metric_for_best_model="eval_loss" if args.load_best_model_at_end else None,
+        greater_is_better=False if args.load_best_model_at_end else None,
         bf16=(args.precision == "bf16"),
         fp16=(args.precision == "fp16"),
         gradient_checkpointing=args.gradient_checkpointing,
         max_grad_norm=args.max_grad_norm,
         dataloader_num_workers=args.num_workers,
-        dataloader_drop_last=True,
+        dataloader_drop_last=False,
         remove_unused_columns=False,
         report_to=[] if args.report_to.lower() in {"none", "no", "false", "0"} else [args.report_to],
+        run_name=run_name,
         disable_tqdm=False,
     )
 
-    trainer = DSSTrainer(
+    trainer = Trainer(
         model=model,
         args=training_args,
         train_dataset=train_dataset,
+        eval_dataset=eval_dataset,
         data_collator=collate_fn,
         tokenizer=tokenizer,
     )
-    trainer.train()
+    if args.resume_from_checkpoint and not torch_supports_safe_checkpoint_resume():
+        print(
+            "Resume fallback: torch<2.6 blocks optimizer/scheduler torch.load in Transformers; "
+            "restoring adapter weights and trainer state without binary optimizer/scheduler state."
+        )
+    with maybe_hide_unsafe_resume_state(args.resume_from_checkpoint):
+        trainer.train(resume_from_checkpoint=args.resume_from_checkpoint or None)
+    trainer.save_model(str(output_dir))
     print(f"Training complete. Adapter saved to {output_dir}")
 
 
