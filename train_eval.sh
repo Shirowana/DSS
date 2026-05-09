@@ -1,14 +1,11 @@
 #!/bin/bash
-# DSS no-basis, stage1-only training entrypoint for the current ablation round.
+# Single-GPU DSS train + full commonsense eval entrypoint.
 #
-# Usage:
-#   bash /root/code/DSS/run_dss.sh
-#
-# Notes:
-# - This script reuses the same remote paths and environment layout as
-#   `scripts/train_commonsense.sh`.
-# - It runs the refactored no-basis DSS path with the official Hugging Face
-#   Trainer and a fixed held-out validation split.
+# Usage examples:
+#   CUDA_VISIBLE_DEVICES=0 THRESHOLD_MODE=oracle tmux new-session -d -s train_oracle \
+#     "cd /root/code/DSS && bash /root/code/DSS/train_eval.sh"
+#   CUDA_VISIBLE_DEVICES=1 THRESHOLD_MODE=sgd QUANTILE_LR=0.03 tmux new-session -d -s train_sgd \
+#     "cd /root/code/DSS && bash /root/code/DSS/train_eval.sh"
 
 set -euo pipefail
 
@@ -40,6 +37,7 @@ if [[ -z "${MODEL_PATH:-}" ]]; then
 fi
 
 DATA_DIR=${DATA_DIR:-"${REMOTE_DATA_ROOT}/commonsense_new"}
+EVAL_DATA_DIR=${EVAL_DATA_DIR:-"${REMOTE_DATA_ROOT}/evaluate"}
 MAX_LENGTH=${MAX_LENGTH:-256}
 DATASET_PATH=${DATASET_PATH:-"${DATA_DIR}/train_all_${MAX_LENGTH}_OnlyOutput_${MODEL_NAME}"}
 VAL_SET_SIZE=${VAL_SET_SIZE:-120}
@@ -72,15 +70,23 @@ NUM_WORKERS=${NUM_WORKERS:-0}
 REPORT_TO=${REPORT_TO:-"wandb"}
 SEED=${SEED:-42}
 RESUME_FROM_CHECKPOINT=${RESUME_FROM_CHECKPOINT:-}
-NUM_GPUS=${NUM_GPUS:-1}
-MASTER_PORT=${MASTER_PORT:-29500}
+NUM_GPUS=1
+
+EVAL_BATCH_SIZE=${EVAL_BATCH_SIZE:-1}
+EVAL_MAX_NEW_TOKENS=${EVAL_MAX_NEW_TOKENS:-32}
+EVAL_NUM_BEAMS=${EVAL_NUM_BEAMS:-4}
+EVAL_DEBUG_EVAL=${EVAL_DEBUG_EVAL:-1}
+EVAL_DEBUG_FIRST_N=${EVAL_DEBUG_FIRST_N:-10}
+EVAL_DEBUG_MAX_FAILURES=${EVAL_DEBUG_MAX_FAILURES:-20}
+EVAL_MAX_EXAMPLES=${EVAL_MAX_EXAMPLES:-0}
 
 EXPERIMENT_RECORD_ENABLED=${EXPERIMENT_RECORD_ENABLED:-1}
-EXPERIMENT_MD=${EXPERIMENT_MD:-}
 
-RUN_NAME=${RUN_NAME:-"commonsense_${MODEL_NAME}_dss_nobasis_nf${N_FREQUENCY}_cand${CANDIDATE_SIZE}_gs${GRAD_STORE_STEPS}_${TIMESTAMP}"}
+RUN_MODE=${RUN_MODE:-"${THRESHOLD_MODE}"}
+RUN_NAME=${RUN_NAME:-"commonsense_${MODEL_NAME}_dss_nobasis_${RUN_MODE}_nf${N_FREQUENCY}_cand${CANDIDATE_SIZE}_gs${GRAD_STORE_STEPS}_${TIMESTAMP}"}
 OUTPUT_DIR=${OUTPUT_DIR:-"${OUTPUT_ROOT}/${RUN_NAME}"}
-LOG_FILE=${LOG_FILE:-"${LOG_ROOT}/${TIMESTAMP}_dss_nobasis.log"}
+LOG_FILE=${LOG_FILE:-"${LOG_ROOT}/${TIMESTAMP}_train_eval_${RUN_MODE}.log"}
+EVAL_OUTPUT_DIR=${EVAL_OUTPUT_DIR:-"${RESULT_ROOT}/${RUN_NAME}_all_eval"}
 
 format_elapsed() {
     local total_seconds=$1
@@ -101,40 +107,59 @@ source ~/miniconda3/etc/profile.d/conda.sh
 conda activate quest
 
 if [[ -z "${CUDA_VISIBLE_DEVICES:-}" ]]; then
-    if [[ "${NUM_GPUS}" -gt 1 ]]; then
-        export CUDA_VISIBLE_DEVICES=0,1
-    else
-        export CUDA_VISIBLE_DEVICES=0
-    fi
+    export CUDA_VISIBLE_DEVICES=0
+fi
+if [[ "${CUDA_VISIBLE_DEVICES}" == *","* ]]; then
+    echo "train_eval.sh only supports one visible GPU. Current CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES}" >&2
+    exit 1
 fi
 export PYTHONPATH="${REMOTE_PEFT_SRC}:${REMOTE_PROJECT_ROOT}:${PYTHONPATH:-}"
 export WANDB_PROJECT=${WANDB_PROJECT:-"dss_commonsense"}
 export WANDB_NAME=${WANDB_NAME:-"${RUN_NAME}"}
 export NCCL_P2P_DISABLE=${NCCL_P2P_DISABLE:-0}
 
+if [[ "${THRESHOLD_MODE}" != "oracle" && "${THRESHOLD_MODE}" != "sgd" ]]; then
+    echo "THRESHOLD_MODE must be oracle or sgd; got ${THRESHOLD_MODE}" >&2
+    exit 1
+fi
+
+for path in "${MODEL_PATH}" "${DATASET_PATH}"; do
+    if [[ ! -e "${path}" ]]; then
+        echo "Required path missing: ${path}" >&2
+        exit 1
+    fi
+done
+
+for dataset in boolq piqa social_i_qa hellaswag winogrande ARC-Challenge ARC-Easy openbookqa; do
+    if [[ ! -f "${EVAL_DATA_DIR}/${dataset}/test.json" ]]; then
+        echo "Missing eval dataset file: ${EVAL_DATA_DIR}/${dataset}/test.json" >&2
+        exit 1
+    fi
+done
+
 if ! python - <<'PY' >/dev/null 2>&1
 import peft  # noqa: F401
 PY
 then
     echo "Failed to import local peft after setting PYTHONPATH=${PYTHONPATH}" >&2
-    echo "Please check REMOTE_PEFT_SRC=${REMOTE_PEFT_SRC} and the local PEFT source tree." >&2
     exit 1
 fi
 
-mkdir -p "${LOG_ROOT}" "${OUTPUT_ROOT}" "${RESULT_ROOT}" "${OUTPUT_DIR}" "${EXPERIMENT_ROOT}"
+mkdir -p "${LOG_ROOT}" "${OUTPUT_ROOT}" "${RESULT_ROOT}" "${OUTPUT_DIR}" "${EXPERIMENT_ROOT}" "${EVAL_OUTPUT_DIR}"
 cd "${REMOTE_PROJECT_ROOT}"
 
 {
-    echo "========== DSS NO-BASIS RUN =========="
+    echo "========== DSS TRAIN+EVAL RUN =========="
     echo "[config] start: $(date)"
+    echo "RUN_MODE=${RUN_MODE}"
+    echo "RUN_NAME=${RUN_NAME}"
     echo "MODEL_NAME=${MODEL_NAME}"
     echo "MODEL_PATH=${MODEL_PATH}"
     echo "MODEL_CACHE_DIR=${MODEL_CACHE_DIR}"
     echo "CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES}"
     echo "NUM_GPUS=${NUM_GPUS}"
-    echo "MASTER_PORT=${MASTER_PORT}"
-    echo "NCCL_P2P_DISABLE=${NCCL_P2P_DISABLE}"
     echo "DATASET_PATH=${DATASET_PATH}"
+    echo "EVAL_DATA_DIR=${EVAL_DATA_DIR}"
     echo "MAX_LENGTH=${MAX_LENGTH}"
     echo "VAL_SET_SIZE=${VAL_SET_SIZE}"
     echo "TARGET_MODULES=${TARGET_MODULES}"
@@ -163,23 +188,22 @@ cd "${REMOTE_PROJECT_ROOT}"
     echo "SEED=${SEED}"
     echo "OUTPUT_DIR=${OUTPUT_DIR}"
     echo "LOG_FILE=${LOG_FILE}"
+    echo "EVAL_OUTPUT_DIR=${EVAL_OUTPUT_DIR}"
+    echo "EVAL_BATCH_SIZE=${EVAL_BATCH_SIZE}"
+    echo "EVAL_MAX_NEW_TOKENS=${EVAL_MAX_NEW_TOKENS}"
+    echo "EVAL_NUM_BEAMS=${EVAL_NUM_BEAMS}"
+    echo "EVAL_DEBUG_EVAL=${EVAL_DEBUG_EVAL}"
+    echo "EVAL_DEBUG_FIRST_N=${EVAL_DEBUG_FIRST_N}"
+    echo "EVAL_DEBUG_MAX_FAILURES=${EVAL_DEBUG_MAX_FAILURES}"
     echo "EXPERIMENT_RECORD_ENABLED=${EXPERIMENT_RECORD_ENABLED}"
-    if [[ -n "${EXPERIMENT_MD}" ]]; then
-        echo "EXPERIMENT_MD=${EXPERIMENT_MD}"
-    fi
     if [[ -n "${RESUME_FROM_CHECKPOINT}" ]]; then
         echo "RESUME_FROM_CHECKPOINT=${RESUME_FROM_CHECKPOINT}"
     fi
     echo
 } | tee "${LOG_FILE}"
 
-launcher=(python)
-if [[ "${NUM_GPUS}" -gt 1 ]]; then
-    launcher=(python -m torch.distributed.run --standalone --nproc_per_node="${NUM_GPUS}" --master_port="${MASTER_PORT}")
-fi
-
 cmd=(
-    "${launcher[@]}"
+    python
     finetune_commonsense.py
     --model_name "${MODEL_NAME}"
     --model_path "${MODEL_PATH}"
@@ -243,6 +267,14 @@ elapsed=$((train_end - train_start))
     echo "output_dir=${OUTPUT_DIR}"
 } | tee -a "${LOG_FILE}"
 
+for artifact in adapter_config.json adapter_model.safetensors training_args.json; do
+    if [[ ! -f "${OUTPUT_DIR}/${artifact}" ]]; then
+        echo "Training artifact missing: ${OUTPUT_DIR}/${artifact}" | tee -a "${LOG_FILE}"
+        echo "训练产物不完整，未开始评测" | tee -a "${LOG_FILE}"
+        exit 1
+    fi
+done
+
 if [[ "${EXPERIMENT_RECORD_ENABLED}" == "1" ]]; then
     python scripts/update_run_record.py \
         --run_name "${RUN_NAME}" \
@@ -250,3 +282,40 @@ if [[ "${EXPERIMENT_RECORD_ENABLED}" == "1" ]]; then
         --log_file "${LOG_FILE}"
     python scripts/export_runs_csv.py
 fi
+
+{
+    echo
+    echo "========== COMMONSENSE EVAL =========="
+    echo "[eval] start: $(date)"
+    echo "adapter_dir=${OUTPUT_DIR}"
+    echo "eval_output_dir=${EVAL_OUTPUT_DIR}"
+} | tee -a "${LOG_FILE}"
+
+EVAL_RUN_NAME="eval_commonsense_${RUN_NAME}_${TIMESTAMP}"
+EVAL_LOG_FILE="${LOG_ROOT}/${EVAL_RUN_NAME}.log"
+
+MODEL_NAME="${MODEL_NAME}" \
+MODEL_PATH="${MODEL_PATH}" \
+DATA_DIR="${EVAL_DATA_DIR}" \
+PRECISION="${PRECISION}" \
+BATCH_SIZE="${EVAL_BATCH_SIZE}" \
+MAX_NEW_TOKENS="${EVAL_MAX_NEW_TOKENS}" \
+NUM_BEAMS="${EVAL_NUM_BEAMS}" \
+MAX_EXAMPLES="${EVAL_MAX_EXAMPLES}" \
+DEBUG_EVAL="${EVAL_DEBUG_EVAL}" \
+DEBUG_FIRST_N="${EVAL_DEBUG_FIRST_N}" \
+DEBUG_MAX_FAILURES="${EVAL_DEBUG_MAX_FAILURES}" \
+RUN_NAME="${EVAL_RUN_NAME}" \
+LOG_FILE="${EVAL_LOG_FILE}" \
+EXPERIMENT_RECORD_ENABLED="${EXPERIMENT_RECORD_ENABLED}" \
+bash "${REMOTE_PROJECT_ROOT}/scripts/eval_commonsense.sh" "${OUTPUT_DIR}" all "${EVAL_OUTPUT_DIR}" 2>&1 | tee -a "${LOG_FILE}"
+
+{
+    echo
+    echo "========== TRAIN+EVAL DONE =========="
+    echo "[done] finish: $(date)"
+    echo "train_log=${LOG_FILE}"
+    echo "eval_log=${EVAL_LOG_FILE}"
+    echo "output_dir=${OUTPUT_DIR}"
+    echo "eval_output_dir=${EVAL_OUTPUT_DIR}"
+} | tee -a "${LOG_FILE}"

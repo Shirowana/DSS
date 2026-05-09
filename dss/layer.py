@@ -5,6 +5,7 @@ from dataclasses import dataclass
 from typing import Any, Optional
 
 import torch
+import torch.distributed as dist
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
@@ -17,6 +18,18 @@ from peft.tuners.tuners_utils import BaseTunerLayer, check_adapters_to_merge
 @dataclass
 class SearchRuntime:
     curr_count: int = 0
+
+
+def _dist_ready() -> bool:
+    return dist.is_available() and dist.is_initialized()
+
+
+def _dist_rank() -> int:
+    return dist.get_rank() if _dist_ready() else 0
+
+
+def _dist_world_size() -> int:
+    return dist.get_world_size() if _dist_ready() else 1
 
 
 class GPUQuantileEstimator:
@@ -178,20 +191,43 @@ class DSSLayer(BaseTunerLayer):
             self.clear_candidate_state(adapter_name)
             return
 
-        sampled = torch.empty(0, device=device, dtype=torch.long)
-        sample_k = max(target_k * 4, target_k)
-        while sampled.numel() < target_k:
-            proposal = torch.randint(0, dense_numel, (sample_k,), device=device)
-            proposal = torch.unique(proposal)
-            proposal = proposal[~elite_bitset[proposal]]
-            sampled = torch.unique(torch.cat([sampled, proposal], dim=0))
-            if sampled.numel() >= target_k or sampled.numel() >= available:
-                break
-            sample_k = min(dense_numel, max(sample_k * 2, target_k))
+        if _dist_rank() == 0:
+            sampled = torch.empty(0, device=device, dtype=torch.long)
+            sample_k = max(target_k * 4, target_k)
+            while sampled.numel() < target_k:
+                proposal = torch.randint(0, dense_numel, (sample_k,), device=device)
+                proposal = torch.unique(proposal)
+                proposal = proposal[~elite_bitset[proposal]]
+                sampled = torch.unique(torch.cat([sampled, proposal], dim=0))
+                if sampled.numel() >= target_k or sampled.numel() >= available:
+                    break
+                sample_k = min(dense_numel, max(sample_k * 2, target_k))
+            sampled = sampled[:target_k].contiguous()
+        else:
+            sampled = torch.empty(target_k, device=device, dtype=torch.long)
+
+        if _dist_ready():
+            dist.broadcast(sampled, src=0)
 
         self.candidate_indices[adapter_name] = sampled[:target_k]
         self.grad_cache[adapter_name] = None
         self.grad_count[adapter_name] = 0
+
+    def sync_stage1_state(self, adapter_name: str) -> None:
+        if not _dist_ready():
+            return
+
+        grad_cache = self.grad_cache.get(adapter_name)
+        if grad_cache is not None and grad_cache.numel() > 0:
+            dist.all_reduce(grad_cache, op=dist.ReduceOp.SUM)
+
+        count_tensor = torch.tensor(
+            [self.grad_count.get(adapter_name, 0)],
+            device=self._adapter_device(adapter_name),
+            dtype=torch.long,
+        )
+        dist.all_reduce(count_tensor, op=dist.ReduceOp.SUM)
+        self.grad_count[adapter_name] = int(count_tensor.item())
 
     def compute_x_mean(self, adapter_name: str) -> torch.Tensor:
         grad_cache = self.grad_cache[adapter_name]
@@ -266,6 +302,7 @@ class DSSLayer(BaseTunerLayer):
         if self.grad_count.get(adapter_name, 0) < self.grad_store_steps[adapter_name]:
             return 0
 
+        self.sync_stage1_state(adapter_name)
         remaining_budget = total_budget - runtime.curr_count
         x_mean = self.compute_x_mean(adapter_name)
         self.update_distribution(adapter_name, x_mean)

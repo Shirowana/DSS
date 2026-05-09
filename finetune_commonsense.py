@@ -164,11 +164,12 @@ def main() -> None:
     args = parse_args()
     set_seed(args.seed)
 
-    if torch.cuda.is_available() and torch.cuda.device_count() > 1:
+    world_size = int(os.environ.get("WORLD_SIZE", "1"))
+    local_rank = int(os.environ.get("LOCAL_RANK", "-1"))
+    if torch.cuda.is_available() and torch.cuda.device_count() > 1 and world_size == 1:
         raise ValueError(
-            "The current DSS no-basis stage1 implementation keeps layer-local runtime state and is not "
-            "safe under multi-GPU DataParallel/replicated training yet. Please expose a single GPU, for example "
-            "with `CUDA_VISIBLE_DEVICES=0`."
+            "Multiple visible GPUs detected without a distributed launcher. "
+            "Use torchrun/DDP instead of single-process replicated training."
         )
 
     if args.val_set_size < 0:
@@ -215,7 +216,13 @@ def main() -> None:
     )
     model = get_peft_model(model, dss_config)
 
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    if torch.cuda.is_available():
+        if local_rank >= 0:
+            device = torch.device(f"cuda:{local_rank}")
+        else:
+            device = torch.device("cuda")
+    else:
+        device = torch.device("cpu")
     model.to(device)
     model.train()
 
@@ -295,6 +302,7 @@ def main() -> None:
         report_to=[] if args.report_to.lower() in {"none", "no", "false", "0"} else [args.report_to],
         run_name=run_name,
         disable_tqdm=False,
+        ddp_find_unused_parameters=True if world_size > 1 else None,
     )
 
     trainer = Trainer(

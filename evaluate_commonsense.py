@@ -1,219 +1,380 @@
-"""
-Evaluate DiaBlo model on commonsense reasoning benchmarks.
+from __future__ import annotations
 
-Supported datasets: boolq, piqa, social_i_qa, hellaswag, winogrande, ARC-Challenge, ARC-Easy, openbookqa
-
-Usage:
-    python evaluate_commonsense.py --model_name Llama2-7B --dataset boolq \
-        --adapter_path results/.../adapter.chkpt --output_dir eval_results/
-"""
-
+import argparse
 import copy
 import json
 import os
 import re
-import argparse
+from pathlib import Path
 
 import torch
 from tqdm import tqdm
-from transformers import GenerationConfig, AutoModelForCausalLM, AutoTokenizer
+from transformers import AutoModelForCausalLM, AutoTokenizer, GenerationConfig
 
-from diablo import replace_linear_with_blocklinear
+from peft import PeftModel
+from peft.tuners.dss import DSSConfig  # noqa: F401 - ensure DSS PEFT type is registered
 
-device = "cuda" if torch.cuda.is_available() else "cpu"
 
-parser = argparse.ArgumentParser()
-parser.add_argument("--dataset", required=True,
-                     choices=["boolq", "piqa", "social_i_qa", "hellaswag", "winogrande", "ARC-Challenge", "ARC-Easy", "openbookqa"])
-parser.add_argument("--model_name", type=str, default="Llama2-7B")
-parser.add_argument("--adapter_path", type=str, default=None, help="Path to adapter.chkpt (None for zero-shot)")
-parser.add_argument("--output_dir", type=str, required=True)
-parser.add_argument("--data_dir", type=str, default="./datasets", help="Dataset directory")
-parser.add_argument("--batch_size", type=int, default=4)
-parser.add_argument("--num_blocks", type=int, default=64)
-parser.add_argument("--target_modules", type=str, default="qkvud")
-parser.add_argument("--precision", type=str, default="bf16", choices=["fp32", "fp16", "bf16"])
-parser.add_argument("--model_cache_dir", type=str, default=None)
-parser.add_argument("--hf_token", type=str, default=None)
-args = parser.parse_args()
+REMOTE_DATA_ROOT = Path("/root/datasets")
+REMOTE_MODEL_ROOT = Path("/root/hf_cache_models/models")
 
-# Setup
-hf_token = args.hf_token or os.environ.get("HF_TOKEN")
-if hf_token:
-    from huggingface_hub import login
-    login(hf_token)
-
-model_dir = args.model_cache_dir or os.environ.get("MODEL_CACHE_DIR", None)
+DATASETS = [
+    "boolq",
+    "piqa",
+    "social_i_qa",
+    "hellaswag",
+    "winogrande",
+    "ARC-Challenge",
+    "ARC-Easy",
+    "openbookqa",
+]
 
 MODEL_MAP = {
-    "Llama2-7B": "/data/home/7250091/date/hf_cache_models/models/Llama-2-7b-hf",
-    "Llama2-13B": "meta-llama/Llama-2-13b-hf",
-    "Llama3-8B": "/data/home/7250091/date/hf_cache_models/models/Meta-Llama-3-8B",
-    "Llama3-3B": "meta-llama/Llama-3.2-3B",
+    "Llama2-7B": str(REMOTE_MODEL_ROOT / "Llama-2-7b-hf"),
+    "Llama3-8B": str(REMOTE_MODEL_ROOT / "Meta-Llama-3-8B"),
 }
-load_name = MODEL_MAP[args.model_name]
-
-if args.precision == "bf16":
-    load_precision = torch.bfloat16
-elif args.precision == "fp16":
-    load_precision = torch.float32
-else:
-    load_precision = torch.float32
-
-compute_precision = torch.bfloat16 if args.precision == "bf16" else torch.float16
-
-MODULE_MAP = {"q": "q_proj", "k": "k_proj", "v": "v_proj", "u": "up_proj", "d": "down_proj", "o": "o_proj", "g": "gate_proj"}
-target_modules_list = [MODULE_MAP[c] for c in args.target_modules if c in MODULE_MAP]
 
 
-def generate_prompt(instruction, input=None):
-    if input:
-        return f"""Below is an instruction that describes a task, paired with an input that provides further context. Write a response that appropriately completes the request.
-
-### Instruction:
-{instruction}
-
-### Input:
-{input}
-
-### Response:
-"""
-    else:
-        return f"""Below is an instruction that describes a task. Write a response that appropriately completes the request.
-
-### Instruction:
-{instruction}
-
-### Response:
-"""
-
-
-def load_data():
-    file_path = os.path.join(args.data_dir, f"{args.dataset}/test.json")
-    if not os.path.exists(file_path):
-        raise FileNotFoundError(f"Cannot find dataset file: {file_path}")
-    return json.load(open(file_path, "r"))
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Evaluate a DSS adapter on commonsense reasoning benchmarks.")
+    parser.add_argument("--dataset", required=True, choices=DATASETS)
+    parser.add_argument("--model_name", type=str, default="Llama3-8B", choices=sorted(MODEL_MAP))
+    parser.add_argument("--model_path", type=str, default=None, help="Explicit local model directory; overrides --model_name.")
+    parser.add_argument("--adapter_path", type=str, default=None, help="Path to a saved PEFT adapter directory.")
+    parser.add_argument("--output_dir", type=str, required=True)
+    parser.add_argument("--data_dir", type=str, default=str(REMOTE_DATA_ROOT / "evaluate"))
+    parser.add_argument("--batch_size", type=int, default=1)
+    parser.add_argument("--precision", type=str, default="bf16", choices=["fp32", "fp16", "bf16"])
+    parser.add_argument("--model_cache_dir", type=str, default=str(REMOTE_MODEL_ROOT))
+    parser.add_argument("--hf_token", type=str, default=None)
+    parser.add_argument("--max_new_tokens", type=int, default=32)
+    parser.add_argument("--num_beams", type=int, default=4)
+    parser.add_argument("--run_name", type=str, default=None)
+    parser.add_argument("--max_examples", type=int, default=0, help="Evaluate at most this many examples; 0 means full dataset.")
+    parser.add_argument("--debug_eval", action="store_true")
+    parser.add_argument("--debug_first_n", type=int, default=10)
+    parser.add_argument("--debug_max_failures", type=int, default=20)
+    return parser.parse_args()
 
 
-def load_model():
-    tokenizer = AutoTokenizer.from_pretrained(load_name, cache_dir=model_dir)
-    tokenizer.padding_side = "left"
-    tokenizer.pad_token_id = 0
+def resolve_precision(name: str) -> torch.dtype:
+    if name == "fp16":
+        return torch.float16
+    if name == "bf16":
+        return torch.bfloat16
+    return torch.float32
 
-    model = AutoModelForCausalLM.from_pretrained(load_name, cache_dir=model_dir, torch_dtype=load_precision)
 
-    if args.num_blocks > 0:
-        replace_linear_with_blocklinear(
-            model.model,
-            num_blocks=args.num_blocks,
-            target_modules=target_modules_list,
+def generate_prompt(instruction: str, input_text: str | None = None) -> str:
+    if input_text:
+        return (
+            "Below is an instruction that describes a task, paired with an input that provides further context. "
+            "Write a response that appropriately completes the request.\n\n"
+            f"### Instruction:\n{instruction}\n\n"
+            f"### Input:\n{input_text}\n\n"
+            "### Response:\n"
         )
+    return (
+        "Below is an instruction that describes a task. Write a response that appropriately completes the request.\n\n"
+        f"### Instruction:\n{instruction}\n\n"
+        "### Response:\n"
+    )
 
-    if args.adapter_path:
-        D = torch.load(args.adapter_path, map_location="cpu")
-        # Remove score parameters if present in old checkpoints
-        D = {k: v for k, v in D.items() if "scores" not in k}
-        model.load_state_dict(D, strict=False)
 
-    model.to(compute_precision).to(device)
-    return tokenizer, model
+def load_data(args: argparse.Namespace) -> list[dict]:
+    file_path = Path(args.data_dir) / args.dataset / "test.json"
+    if not file_path.exists():
+        raise FileNotFoundError(f"Cannot find dataset file: {file_path}")
+    with file_path.open("r", encoding="utf-8") as handle:
+        dataset = json.load(handle)
+    if args.max_examples and args.max_examples > 0:
+        dataset = dataset[: args.max_examples]
+    return dataset
 
-'''
-def extract_answer(sentence: str) -> str:
-    sentence_ = sentence.strip()
-    if args.dataset == "boolq":
-        pred = re.findall(r"true|false", sentence_)
-    elif args.dataset == "piqa":
-        pred = re.findall(r"solution1|solution2", sentence_)
-    elif args.dataset in ["social_i_qa", "ARC-Challenge", "ARC-Easy", "openbookqa"]:
-        pred = re.findall(r"answer1|answer2|answer3|answer4|answer5", sentence_)
-    elif args.dataset == "hellaswag":
-        pred = re.findall(r"ending1|ending2|ending3|ending4", sentence_)
-    elif args.dataset == "winogrande":
-        pred = re.findall(r"option1|option2", sentence_)
+
+def resolve_adapter_dir(adapter_path: str | None) -> str | None:
+    if not adapter_path:
+        return None
+    path = Path(adapter_path)
+    if path.is_file():
+        if path.name not in {"adapter_model.safetensors", "adapter_model.bin"}:
+            raise ValueError(f"Unsupported adapter file path: {adapter_path}. Please pass an adapter directory.")
+        path = path.parent
+    config_path = path / "adapter_config.json"
+    if not config_path.exists():
+        raise FileNotFoundError(f"Adapter directory does not contain adapter_config.json: {path}")
+    return str(path)
+
+
+def load_model(args: argparse.Namespace):
+    hf_token = args.hf_token or os.environ.get("HF_TOKEN")
+    if hf_token:
+        from huggingface_hub import login
+
+        login(hf_token)
+
+    model_dir = args.model_cache_dir or os.environ.get("MODEL_CACHE_DIR")
+    load_name = args.model_path or MODEL_MAP[args.model_name]
+    torch_dtype = resolve_precision(args.precision)
+
+    tokenizer = AutoTokenizer.from_pretrained(load_name, cache_dir=model_dir)
+    if tokenizer.pad_token_id is None:
+        tokenizer.pad_token = tokenizer.eos_token
+    tokenizer.padding_side = "left"
+
+    model = AutoModelForCausalLM.from_pretrained(load_name, cache_dir=model_dir, torch_dtype=torch_dtype)
+    model.config.pad_token_id = tokenizer.pad_token_id
+    if tokenizer.pad_token_id is not None and len(tokenizer) != model.get_input_embeddings().num_embeddings:
+        model.resize_token_embeddings(len(tokenizer))
+
+    adapter_dir = resolve_adapter_dir(args.adapter_path)
+    print(f"[eval] base_model={load_name}")
+    print(f"[eval] model_cache_dir={model_dir}")
+    if adapter_dir:
+        print(f"[eval] adapter_dir={adapter_dir}")
+        model = PeftModel.from_pretrained(model, adapter_dir)
+        model = model.merge_and_unload()
+        print("[eval] merged adapter into base model for inference")
     else:
-        pred = []
-    return pred[0] if pred else ""
-'''
+        print("[eval] adapter_dir=(none; zero-shot base model)")
 
-def normalize_label(text: str) -> str:
-    """
-    把 gold label / 模型输出统一归一化：
-    - BoolQ: true / false
-    - 其他多选题: solution1 / answer1 / option1 / ending1 -> choice1
-    """
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model.to(device)
+    model.eval()
+    return tokenizer, model, device
+
+
+def normalize_label(dataset: str, text: str | None) -> str:
     if text is None:
         return ""
-    s = text.strip().lower()
-    # BoolQ
-    if args.dataset == "boolq":
-        if re.search(r"\btrue\b", s):
-            return "true"
-        if re.search(r"\bfalse\b", s):
-            return "false"
-        return ""
-    # 通用多选：统一抽取编号
-    m = re.findall(r"\b(?:solution|answer|option|ending)\s*([1-5])\b", s)
-    if m:
-        return f"choice{m[-1]}"   # 取最后一个，避免前面残留干扰
+    raw = text.strip()
+    s = raw.lower()
+    if dataset == "boolq":
+        matches = re.findall(r"\b(true|false)\b", raw, flags=re.IGNORECASE)
+        matches = [match.lower() for match in matches]
+        return matches[-1] if matches else ""
 
+    patterns = {
+        "piqa": [r"\b(solution|choice)\s*([12])\b", r"\b([12])\b"],
+        "social_i_qa": [r"\b(answer|choice)\s*([123])\b", r"\b([123])\b"],
+        "hellaswag": [r"\b(ending|choice)\s*([1234])\b", r"\b([1234])\b"],
+        "winogrande": [r"\b(option|choice)\s*([12])\b", r"\b([12])\b"],
+        "ARC-Challenge": [r"\b(answer|choice)\s*([12345])\b", r"\b([12345])\b"],
+        "ARC-Easy": [r"\b(answer|choice)\s*([12345])\b", r"\b([12345])\b"],
+        "openbookqa": [r"\b(answer|choice)\s*([12345])\b", r"\b([12345])\b"],
+    }
+
+    for pattern in patterns.get(dataset, []):
+        matches = re.findall(pattern, s)
+        if matches:
+            last = matches[-1]
+            if isinstance(last, tuple):
+                return f"choice{last[1]}"
+            return f"choice{last}"
     return ""
 
 
-def extract_answer(sentence: str) -> str:
-    """
-    从模型生成文本中提取最终答案，并做归一化。
-    """
-    return normalize_label(sentence)
+def extract_answer(dataset: str, sentence: str) -> str:
+    return normalize_label(dataset, sentence)
 
 
-def main():
-    dataset = load_data()
-    tokenizer, model = load_model()
-    model.eval()
+def debug_candidate_variants(dataset: str) -> dict[str, list[str]]:
+    if dataset == "boolq":
+        return {
+            "true": ["true", " true", "\ntrue", "True", " True", "\nTrue"],
+            "false": ["false", " false", "\nfalse", "False", " False", "\nFalse"],
+        }
+    if dataset in {"piqa", "winogrande"}:
+        return {
+            "1": ["1", " 1", "\n1"],
+            "2": ["2", " 2", "\n2"],
+        }
+    if dataset == "social_i_qa":
+        return {
+            "1": ["1", " 1", "\n1"],
+            "2": ["2", " 2", "\n2"],
+            "3": ["3", " 3", "\n3"],
+        }
+    if dataset == "hellaswag":
+        return {
+            "1": ["1", " 1", "\n1"],
+            "2": ["2", " 2", "\n2"],
+            "3": ["3", " 3", "\n3"],
+            "4": ["4", " 4", "\n4"],
+        }
+    return {
+        "1": ["1", " 1", "\n1"],
+        "2": ["2", " 2", "\n2"],
+        "3": ["3", " 3", "\n3"],
+        "4": ["4", " 4", "\n4"],
+        "5": ["5", " 5", "\n5"],
+    }
 
-    os.makedirs(args.output_dir, exist_ok=True)
-    save_file = os.path.join(args.output_dir, f"{args.dataset}.json")
+
+def build_debug_logits(tokenizer, dataset: str, first_step_scores: torch.Tensor) -> list[dict[str, object]]:
+    rows: list[dict[str, object]] = []
+    for label, variants in debug_candidate_variants(dataset).items():
+        best = None
+        for variant in variants:
+            token_ids = tokenizer.encode(variant, add_special_tokens=False)
+            if not token_ids:
+                continue
+            token_id = token_ids[0]
+            logit = float(first_step_scores[token_id].item())
+            decoded = tokenizer.decode([token_id], skip_special_tokens=False)
+            candidate = {
+                "label": label,
+                "variant": variant,
+                "token_id": token_id,
+                "decoded_token": decoded,
+                "logit": logit,
+            }
+            if best is None or logit > best["logit"]:
+                best = candidate
+        if best is not None:
+            rows.append(best)
+    return rows
+
+
+def build_topk_debug(tokenizer, first_step_scores: torch.Tensor, topk: int = 10) -> list[dict[str, object]]:
+    values, indices = torch.topk(first_step_scores, k=min(topk, first_step_scores.shape[-1]))
+    rows: list[dict[str, object]] = []
+    for value, index in zip(values.tolist(), indices.tolist()):
+        rows.append(
+            {
+                "token_id": int(index),
+                "decoded_token": tokenizer.decode([int(index)], skip_special_tokens=False),
+                "logit": float(value),
+            }
+        )
+    return rows
+
+
+def write_summary(output_dir: Path, dataset: str, correct: int, total: int, run_name: str | None) -> None:
+    summary_path = output_dir / "summary.json"
+    if summary_path.exists():
+        with summary_path.open("r", encoding="utf-8") as handle:
+            summary = json.load(handle)
+    else:
+        summary = {"run_name": run_name or "", "datasets": {}}
+
+    accuracy = correct / max(total, 1)
+    summary["run_name"] = run_name or summary.get("run_name", "")
+    summary["datasets"][dataset] = {
+        "correct": correct,
+        "total": total,
+        "accuracy": accuracy,
+    }
+    accuracies = [float(stats["accuracy"]) for stats in summary["datasets"].values()]
+    summary["average_accuracy"] = sum(accuracies) / len(accuracies) if accuracies else 0.0
+
+    with summary_path.open("w", encoding="utf-8") as handle:
+        json.dump(summary, handle, indent=2, ensure_ascii=False)
+
+
+def main() -> None:
+    args = parse_args()
+    dataset = load_data(args)
+    print(f"[eval] dataset_file={Path(args.data_dir) / args.dataset / 'test.json'}")
+    print(f"[eval] dataset_size={len(dataset)}")
+    if args.max_examples and args.max_examples > 0:
+        print(f"[eval] max_examples={args.max_examples}")
+    tokenizer, model, device = load_model(args)
+
+    output_dir = Path(args.output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    save_file = output_dir / f"{args.dataset}.json"
 
     batches = [dataset[i : i + args.batch_size] for i in range(0, len(dataset), args.batch_size)]
+    generation_config = GenerationConfig(
+        temperature=0.1,
+        top_p=0.75,
+        top_k=40,
+        num_beams=args.num_beams,
+        do_sample=False,
+    )
 
     correct = 0
     current = 0
-    output_data = []
+    failures = 0
+    debug_printed = 0
+    output_data: list[dict] = []
 
     for idx, batch in enumerate(tqdm(batches, desc=f"Evaluating {args.dataset}")):
         current += len(batch)
-        instructions = [data.get("instruction") for data in batch]
-        prompts = [generate_prompt(inst) for inst in instructions]
+        instructions = [data.get("instruction", "") for data in batch]
+        input_texts = [data.get("input") or "" for data in batch]
+        prompts = [generate_prompt(inst, input_text if input_text else None) for inst, input_text in zip(instructions, input_texts)]
         inputs = tokenizer(prompts, return_tensors="pt", padding=True)
 
-        generation_config = GenerationConfig(
-            temperature=0.1, top_p=0.75, top_k=40, num_beams=4, do_sample=False
-        )
         with torch.no_grad():
             generation_output = model.generate(
                 input_ids=inputs["input_ids"].to(device),
                 attention_mask=inputs["attention_mask"].to(device),
                 generation_config=generation_config,
                 return_dict_in_generate=True,
-                output_scores=True,
-                max_new_tokens=32,
+                output_scores=args.debug_eval,
+                max_new_tokens=args.max_new_tokens,
             )
 
         sequences = generation_output.sequences
         prompt_lens = inputs["attention_mask"].sum(dim=1).tolist()
-
         outputs = []
         for i, seq in enumerate(sequences):
-            gen_ids = seq[prompt_lens[i]:]
-            output = tokenizer.decode(gen_ids, skip_special_tokens=True).strip()
-            outputs.append(output)
-        for data, output in zip(batch, outputs):
-            label = normalize_label(data.get("answer"))
-            predict = extract_answer(output)
-            flag = (label == predict)
+            gen_ids = seq[prompt_lens[i] :]
+            outputs.append(tokenizer.decode(gen_ids, skip_special_tokens=True).strip())
+
+        first_step_scores = None
+        if args.debug_eval and generation_output.scores:
+            first_step_scores = generation_output.scores[0]
+
+        for item_idx, (data, output) in enumerate(zip(batch, outputs)):
+            label = normalize_label(args.dataset, data.get("answer"))
+            predict = extract_answer(args.dataset, output)
+            flag = label == predict
             if flag:
                 correct += 1
+            elif args.debug_eval and failures < args.debug_max_failures:
+                failures += 1
+
+            if args.debug_eval and debug_printed < args.debug_first_n:
+                sample_scores = None
+                if first_step_scores is not None:
+                    beam_row = item_idx * max(args.num_beams, 1)
+                    beam_row = min(beam_row, first_step_scores.shape[0] - 1)
+                    sample_scores = first_step_scores[beam_row].detach().float().cpu()
+
+                print("\n========== DEBUG SAMPLE ==========", flush=True)
+                print(f"[debug] dataset={args.dataset}", flush=True)
+                print(f"[debug] sample_index={debug_printed}", flush=True)
+                print(f"[debug] gold_raw={data.get('answer')!r}", flush=True)
+                print(f"[debug] gold_norm={label!r}", flush=True)
+                print(f"[debug] pred_norm={predict!r}", flush=True)
+                print(f"[debug] flag={flag}", flush=True)
+                print("[debug] prompt:", flush=True)
+                print(prompts[item_idx], flush=True)
+                print("[debug] raw_output:", flush=True)
+                print(output, flush=True)
+                if sample_scores is not None:
+                    print("[debug] candidate_first_token_logits:", flush=True)
+                    print(
+                        json.dumps(
+                            build_debug_logits(tokenizer, args.dataset, sample_scores),
+                            ensure_ascii=False,
+                            indent=2,
+                        ),
+                        flush=True,
+                    )
+                    print("[debug] top10_first_token_logits:", flush=True)
+                    print(
+                        json.dumps(
+                            build_topk_debug(tokenizer, sample_scores, topk=10),
+                            ensure_ascii=False,
+                            indent=2,
+                        ),
+                        flush=True,
+                    )
+                debug_printed += 1
 
             new_data = copy.deepcopy(data)
             new_data["output_pred"] = output
@@ -221,12 +382,14 @@ def main():
             new_data["flag"] = flag
             output_data.append(new_data)
 
-        print(f"  {idx + 1}/{len(batches)} | accuracy: {correct}/{current} = {correct / current:.4f}")
-        with open(save_file, "w") as f:
-            json.dump(output_data, f, indent=4)
+        accuracy = correct / max(current, 1)
+        print(f"  {idx + 1}/{len(batches)} | accuracy: {correct}/{current} = {accuracy:.4f}", flush=True)
+        with save_file.open("w", encoding="utf-8") as handle:
+            json.dump(output_data, handle, indent=2, ensure_ascii=False)
 
-
-    print(f"\nFinal accuracy: {correct}/{current} = {correct / current:.4f}")
+    final_accuracy = correct / max(current, 1)
+    write_summary(output_dir, args.dataset, correct, current, args.run_name)
+    print(f"\nFinal accuracy: {correct}/{current} = {final_accuracy:.4f}")
 
 
 if __name__ == "__main__":
