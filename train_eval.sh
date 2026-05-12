@@ -53,6 +53,11 @@ THRESHOLD_MODE=${THRESHOLD_MODE:-"oracle"}
 DSS_DROPOUT=${DSS_DROPOUT:-0.05}
 QUANTILE_LR=${QUANTILE_LR:-0.01}
 QUANTILE_ALPHA=${QUANTILE_ALPHA:-0.0}
+THRESHOLD_LOG_EVERY_STEPS=${THRESHOLD_LOG_EVERY_STEPS:-1000}
+INIT_ENABLED=${INIT_ENABLED:-0}
+INIT_STEPS=${INIT_STEPS:-10}
+INIT_CANDIDATE_RATIO=${INIT_CANDIDATE_RATIO:-0.05}
+INIT_SEED_MODE=${INIT_SEED_MODE:-"threshold_only"}
 
 BATCH_SIZE=${BATCH_SIZE:-16}
 GRAD_ACCUM_STEPS=${GRAD_ACCUM_STEPS:-1}
@@ -70,7 +75,8 @@ NUM_WORKERS=${NUM_WORKERS:-0}
 REPORT_TO=${REPORT_TO:-"wandb"}
 SEED=${SEED:-42}
 RESUME_FROM_CHECKPOINT=${RESUME_FROM_CHECKPOINT:-}
-NUM_GPUS=1
+NUM_GPUS=${NUM_GPUS:-}
+MASTER_PORT=${MASTER_PORT:-29500}
 
 EVAL_BATCH_SIZE=${EVAL_BATCH_SIZE:-1}
 EVAL_MAX_NEW_TOKENS=${EVAL_MAX_NEW_TOKENS:-32}
@@ -109,8 +115,16 @@ conda activate quest
 if [[ -z "${CUDA_VISIBLE_DEVICES:-}" ]]; then
     export CUDA_VISIBLE_DEVICES=0
 fi
+
+visible_gpu_count=1
 if [[ "${CUDA_VISIBLE_DEVICES}" == *","* ]]; then
-    echo "train_eval.sh only supports one visible GPU. Current CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES}" >&2
+    visible_gpu_count=$(awk -F',' '{print NF}' <<< "${CUDA_VISIBLE_DEVICES}")
+fi
+if [[ -z "${NUM_GPUS}" ]]; then
+    NUM_GPUS=${visible_gpu_count}
+fi
+if [[ "${NUM_GPUS}" -gt "${visible_gpu_count}" ]]; then
+    echo "NUM_GPUS=${NUM_GPUS} exceeds visible GPUs (${CUDA_VISIBLE_DEVICES})" >&2
     exit 1
 fi
 export PYTHONPATH="${REMOTE_PEFT_SRC}:${REMOTE_PROJECT_ROOT}:${PYTHONPATH:-}"
@@ -173,6 +187,11 @@ cd "${REMOTE_PROJECT_ROOT}"
     echo "DSS_DROPOUT=${DSS_DROPOUT}"
     echo "QUANTILE_LR=${QUANTILE_LR}"
     echo "QUANTILE_ALPHA=${QUANTILE_ALPHA}"
+    echo "THRESHOLD_LOG_EVERY_STEPS=${THRESHOLD_LOG_EVERY_STEPS}"
+    echo "INIT_ENABLED=${INIT_ENABLED}"
+    echo "INIT_STEPS=${INIT_STEPS}"
+    echo "INIT_CANDIDATE_RATIO=${INIT_CANDIDATE_RATIO}"
+    echo "INIT_SEED_MODE=${INIT_SEED_MODE}"
     echo "BATCH_SIZE=${BATCH_SIZE}"
     echo "GRAD_ACCUM_STEPS=${GRAD_ACCUM_STEPS}"
     echo "NUM_EPOCHS=${NUM_EPOCHS}"
@@ -202,8 +221,7 @@ cd "${REMOTE_PROJECT_ROOT}"
     echo
 } | tee "${LOG_FILE}"
 
-cmd=(
-    python
+train_cmd=(
     finetune_commonsense.py
     --model_name "${MODEL_NAME}"
     --model_path "${MODEL_PATH}"
@@ -223,6 +241,10 @@ cmd=(
     --dropout "${DSS_DROPOUT}"
     --quantile_lr "${QUANTILE_LR}"
     --quantile_alpha "${QUANTILE_ALPHA}"
+    --threshold_log_every_steps "${THRESHOLD_LOG_EVERY_STEPS}"
+    --init_steps "${INIT_STEPS}"
+    --init_candidate_ratio "${INIT_CANDIDATE_RATIO}"
+    --init_seed_mode "${INIT_SEED_MODE}"
     --batch_size "${BATCH_SIZE}"
     --gradient_accumulation_steps "${GRAD_ACCUM_STEPS}"
     --num_epochs "${NUM_EPOCHS}"
@@ -241,12 +263,16 @@ cmd=(
     --seed "${SEED}"
 )
 
+if [[ "${INIT_ENABLED}" == "1" ]]; then
+    train_cmd+=(--init_enabled)
+fi
+
 if [[ "${LOAD_BEST_MODEL_AT_END}" == "1" ]]; then
-    cmd+=(--load_best_model_at_end)
+    train_cmd+=(--load_best_model_at_end)
 fi
 
 if [[ -n "${RESUME_FROM_CHECKPOINT}" ]]; then
-    cmd+=(--resume_from_checkpoint "${RESUME_FROM_CHECKPOINT}")
+    train_cmd+=(--resume_from_checkpoint "${RESUME_FROM_CHECKPOINT}")
 fi
 
 {
@@ -255,7 +281,23 @@ fi
 } | tee -a "${LOG_FILE}"
 train_start=$(date +%s)
 
-"${cmd[@]}" 2>&1 | tee -a "${LOG_FILE}"
+if [[ "${NUM_GPUS}" -gt 1 ]]; then
+    launch_cmd=(
+        python
+        -m
+        torch.distributed.run
+        --nproc_per_node "${NUM_GPUS}"
+        --master_port "${MASTER_PORT}"
+        "${train_cmd[@]}"
+    )
+else
+    launch_cmd=(
+        python
+        "${train_cmd[@]}"
+    )
+fi
+
+"${launch_cmd[@]}" 2>&1 | tee -a "${LOG_FILE}"
 
 train_end=$(date +%s)
 elapsed=$((train_end - train_start))

@@ -49,6 +49,26 @@ class DSSConfig(PeftConfig):
         default=0.0,
         metadata={"help": "Reserved alpha parameter for the online quantile estimator."},
     )
+    threshold_log_every_steps: int = field(
+        default=1000,
+        metadata={"help": "Print DSS threshold debug info on first refresh and then every N optimizer steps per layer."},
+    )
+    init_enabled: bool = field(
+        default=False,
+        metadata={"help": "Enable the initial gradient-observation window before normal stage1 refresh begins."},
+    )
+    init_steps: int = field(
+        default=10,
+        metadata={"help": "How many early optimizer steps to use for the initialization observation window."},
+    )
+    init_candidate_ratio: float = field(
+        default=0.05,
+        metadata={"help": "Per-matrix candidate ratio used during initialization block sampling."},
+    )
+    init_seed_mode: str = field(
+        default="threshold_only",
+        metadata={"help": "Initialization behavior. Supported values: `threshold_only`, `seed_elite`."},
+    )
     fan_in_fan_out: bool = field(
         default=False,
         metadata={"help": "Set to True if the target layer stores weights as (fan_in, fan_out)."},
@@ -111,4 +131,11 @@ class DSSConfig(PeftConfig):
             raise ValueError("`dropout` must be in the interval [0, 1).")
         if self.quantile_lr <= 0.0:
             raise ValueError("`quantile_lr` must be positive.")
-
+        if self.threshold_log_every_steps <= 0:
+            raise ValueError("`threshold_log_every_steps` must be a positive integer.")
+        if self.init_steps <= 0:
+            raise ValueError("`init_steps` must be a positive integer.")
+        if not 0.0 < self.init_candidate_ratio <= 1.0:
+            raise ValueError("`init_candidate_ratio` must be in the interval (0, 1].")
+        if self.init_seed_mode not in {"threshold_only", "seed_elite"}:
+            raise ValueError("`init_seed_mode` must be `threshold_only` or `seed_elite`.")

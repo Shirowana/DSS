@@ -18,6 +18,12 @@ from peft.tuners.tuners_utils import BaseTunerLayer, check_adapters_to_merge
 @dataclass
 class SearchRuntime:
     curr_count: int = 0
+    total_steps: int = 0
+    refresh_rounds: int = 0
+    last_logged_step: int = -1
+    init_phase: bool = False
+    init_done: bool = False
+    pending_init_threshold: Optional[float] = None
 
 
 def _dist_ready() -> bool:
@@ -26,10 +32,6 @@ def _dist_ready() -> bool:
 
 def _dist_rank() -> int:
     return dist.get_rank() if _dist_ready() else 0
-
-
-def _dist_world_size() -> int:
-    return dist.get_world_size() if _dist_ready() else 1
 
 
 class GPUQuantileEstimator:
@@ -102,6 +104,11 @@ class DSSLayer(BaseTunerLayer):
         self.up: dict[str, int] = {}
         self.threshold_mode: dict[str, str] = {}
         self.module_name: dict[str, str] = {}
+        self.threshold_log_every_steps: dict[str, int] = {}
+        self.init_enabled: dict[str, bool] = {}
+        self.init_steps: dict[str, int] = {}
+        self.init_candidate_ratio: dict[str, float] = {}
+        self.init_seed_mode: dict[str, str] = {}
 
         base_layer = self.get_base_layer()
         if isinstance(base_layer, nn.Linear):
@@ -191,43 +198,43 @@ class DSSLayer(BaseTunerLayer):
             self.clear_candidate_state(adapter_name)
             return
 
-        if _dist_rank() == 0:
-            sampled = torch.empty(0, device=device, dtype=torch.long)
-            sample_k = max(target_k * 4, target_k)
-            while sampled.numel() < target_k:
-                proposal = torch.randint(0, dense_numel, (sample_k,), device=device)
-                proposal = torch.unique(proposal)
-                proposal = proposal[~elite_bitset[proposal]]
-                sampled = torch.unique(torch.cat([sampled, proposal], dim=0))
-                if sampled.numel() >= target_k or sampled.numel() >= available:
-                    break
-                sample_k = min(dense_numel, max(sample_k * 2, target_k))
-            sampled = sampled[:target_k].contiguous()
-        else:
-            sampled = torch.empty(target_k, device=device, dtype=torch.long)
-
-        if _dist_ready():
-            dist.broadcast(sampled, src=0)
+        sampled = torch.empty(0, device=device, dtype=torch.long)
+        sample_k = max(target_k * 4, target_k)
+        while sampled.numel() < target_k:
+            proposal = torch.randint(0, dense_numel, (sample_k,), device=device)
+            proposal = torch.unique(proposal)
+            proposal = proposal[~elite_bitset[proposal]]
+            sampled = torch.unique(torch.cat([sampled, proposal], dim=0))
+            if sampled.numel() >= target_k or sampled.numel() >= available:
+                break
+            sample_k = min(dense_numel, max(sample_k * 2, target_k))
 
         self.candidate_indices[adapter_name] = sampled[:target_k]
         self.grad_cache[adapter_name] = None
         self.grad_count[adapter_name] = 0
 
-    def sync_stage1_state(self, adapter_name: str) -> None:
-        if not _dist_ready():
-            return
-
-        grad_cache = self.grad_cache.get(adapter_name)
-        if grad_cache is not None and grad_cache.numel() > 0:
-            dist.all_reduce(grad_cache, op=dist.ReduceOp.SUM)
-
-        count_tensor = torch.tensor(
-            [self.grad_count.get(adapter_name, 0)],
-            device=self._adapter_device(adapter_name),
-            dtype=torch.long,
-        )
-        dist.all_reduce(count_tensor, op=dist.ReduceOp.SUM)
-        self.grad_count[adapter_name] = int(count_tensor.item())
+    def refresh_init_candidate_batch(self, adapter_name: str) -> None:
+        device = self._adapter_device(adapter_name)
+        rows, cols = self.out_features, self.in_features
+        ratio = self.init_candidate_ratio[adapter_name]
+        block_size = 64
+        blocks: list[torch.Tensor] = []
+        for row_start in range(0, rows, block_size):
+            block_rows = min(block_size, rows - row_start)
+            for col_start in range(0, cols, block_size):
+                block_cols = min(block_size, cols - col_start)
+                block_numel = block_rows * block_cols
+                take = max(1, int(round(block_numel * ratio)))
+                local_perm = torch.randperm(block_numel, device=device)[:take]
+                local_rows = local_perm // block_cols
+                local_cols = local_perm % block_cols
+                flat = (row_start + local_rows) * cols + (col_start + local_cols)
+                blocks.append(flat.to(dtype=torch.long))
+        sampled = torch.cat(blocks, dim=0) if blocks else torch.empty(0, device=device, dtype=torch.long)
+        sampled = torch.unique(sampled)
+        self.candidate_indices[adapter_name] = sampled
+        self.grad_cache[adapter_name] = None
+        self.grad_count[adapter_name] = 0
 
     def compute_x_mean(self, adapter_name: str) -> torch.Tensor:
         grad_cache = self.grad_cache[adapter_name]
@@ -256,11 +263,90 @@ class DSSLayer(BaseTunerLayer):
         for start in range(0, total_samples, batch_size):
             search_estimator.update(shuffled[start : start + batch_size])
 
-    def select_location(self, adapter_name: str, x_mean: torch.Tensor, remaining_budget: int) -> torch.Tensor:
+    def _should_log_threshold(self, adapter_name: str) -> bool:
+        runtime = self.runtime[adapter_name]
+        log_every = self.threshold_log_every_steps[adapter_name]
+        if runtime.refresh_rounds == 0:
+            return True
+        return (runtime.total_steps - runtime.last_logged_step) >= log_every
+
+    def _log_threshold_debug(
+        self,
+        adapter_name: str,
+        threshold: torch.Tensor,
+        x_mean: torch.Tensor,
+        selected: torch.Tensor,
+        remaining_budget: int,
+    ) -> None:
+        if _dist_rank() != 0 or not self._should_log_threshold(adapter_name):
+            return
+
+        runtime = self.runtime[adapter_name]
+        promoted = int(selected.numel())
+        threshold_value = float(threshold.detach().float().item()) if threshold.numel() == 1 else float("nan")
+        x_mean_mean = float(x_mean.mean().item()) if x_mean.numel() > 0 else 0.0
+        x_mean_max = float(x_mean.max().item()) if x_mean.numel() > 0 else 0.0
+        x_mean_min = float(x_mean.min().item()) if x_mean.numel() > 0 else 0.0
+        candidate_count = int(self.candidate_indices[adapter_name].numel())
+        print(
+            "[DSS threshold] "
+            f"module={self.module_name.get(adapter_name, '')} "
+            f"mode={self.threshold_mode[adapter_name]} "
+            f"step={runtime.total_steps} "
+            f"refresh={runtime.refresh_rounds + 1} "
+            f"threshold={threshold_value:.8f} "
+            f"x_mean_min={x_mean_min:.8f} "
+            f"x_mean_mean={x_mean_mean:.8f} "
+            f"x_mean_max={x_mean_max:.8f} "
+            f"candidates={candidate_count} "
+            f"selected={promoted} "
+            f"curr_count={runtime.curr_count} "
+            f"remaining_budget={remaining_budget}",
+            flush=True,
+        )
+        runtime.last_logged_step = runtime.total_steps
+
+    def _log_init_debug(
+        self,
+        adapter_name: str,
+        threshold: torch.Tensor,
+        x_mean: torch.Tensor,
+        selected: torch.Tensor,
+    ) -> None:
+        if _dist_rank() != 0:
+            return
+        runtime = self.runtime[adapter_name]
+        threshold_value = float(threshold.detach().float().item()) if threshold.numel() == 1 else float("nan")
+        x_mean_mean = float(x_mean.mean().item()) if x_mean.numel() > 0 else 0.0
+        x_mean_max = float(x_mean.max().item()) if x_mean.numel() > 0 else 0.0
+        x_mean_min = float(x_mean.min().item()) if x_mean.numel() > 0 else 0.0
+        print(
+            "[DSS init] "
+            f"module={self.module_name.get(adapter_name, '')} "
+            f"mode={self.threshold_mode[adapter_name]} "
+            f"step={runtime.total_steps} "
+            f"init_steps={self.init_steps[adapter_name]} "
+            f"seed_mode={self.init_seed_mode[adapter_name]} "
+            f"threshold={threshold_value:.8f} "
+            f"x_mean_min={x_mean_min:.8f} "
+            f"x_mean_mean={x_mean_mean:.8f} "
+            f"x_mean_max={x_mean_max:.8f} "
+            f"candidates={int(self.candidate_indices[adapter_name].numel())} "
+            f"selected={int(selected.numel())} "
+            f"curr_count={runtime.curr_count}",
+            flush=True,
+        )
+
+    def select_location_with_threshold(
+        self,
+        adapter_name: str,
+        x_mean: torch.Tensor,
+        remaining_budget: int,
+        threshold: torch.Tensor,
+    ) -> torch.Tensor:
         if x_mean.numel() == 0 or remaining_budget <= 0:
             return torch.empty(0, device=x_mean.device, dtype=torch.long)
 
-        threshold = self.search_quantile_estimator[adapter_name].get_quantile()
         numel = x_mean.numel()
         real_up = min(self.up[adapter_name], remaining_budget, numel)
         real_low = min(self.low[adapter_name], remaining_budget, numel)
@@ -274,6 +360,18 @@ class DSSLayer(BaseTunerLayer):
                 return torch.empty(0, device=x_mean.device, dtype=torch.long)
             return torch.argsort(x_mean.float(), descending=True)[:real_low]
         return torch.nonzero(candidate_mask, as_tuple=True)[0]
+
+    def select_location(self, adapter_name: str, x_mean: torch.Tensor, remaining_budget: int) -> torch.Tensor:
+        threshold = self.search_quantile_estimator[adapter_name].get_quantile()
+        return self.select_location_with_threshold(adapter_name, x_mean, remaining_budget, threshold)
+
+    def select_init_seed_locations(self, x_mean: torch.Tensor, remaining_budget: int, threshold: torch.Tensor) -> torch.Tensor:
+        if x_mean.numel() == 0 or remaining_budget <= 0:
+            return torch.empty(0, device=x_mean.device, dtype=torch.long)
+        selected = torch.nonzero(x_mean.float() > threshold, as_tuple=True)[0]
+        if selected.numel() > remaining_budget:
+            selected = torch.argsort(x_mean.float(), descending=True)[:remaining_budget]
+        return selected
 
     def apply_stage1_promotions(self, adapter_name: str, selected: torch.Tensor) -> int:
         if selected.numel() == 0:
@@ -296,18 +394,55 @@ class DSSLayer(BaseTunerLayer):
             self.clear_candidate_state(adapter_name)
             return 0
 
+        if runtime.init_phase:
+            if self.candidate_indices[adapter_name].numel() == 0:
+                self.refresh_init_candidate_batch(adapter_name)
+            if self.grad_count.get(adapter_name, 0) < self.init_steps[adapter_name]:
+                return 0
+
+            x_mean = self.compute_x_mean(adapter_name)
+            candidates_data = x_mean.reshape(-1).float()
+            threshold = torch.tensor(0.0, device=x_mean.device, dtype=torch.float32)
+            if candidates_data.numel() > 0 and candidates_data.max() > 0:
+                threshold = torch.quantile(candidates_data, self.search_quantile_estimator[adapter_name].q)
+
+            selected = torch.empty(0, device=x_mean.device, dtype=torch.long)
+            if self.init_seed_mode[adapter_name] == "seed_elite":
+                remaining_budget = total_budget - runtime.curr_count
+                selected = self.select_init_seed_locations(x_mean, remaining_budget, threshold)
+                self.apply_stage1_promotions(adapter_name, selected)
+
+            if self.threshold_mode[adapter_name] == "sgd":
+                self.search_quantile_estimator[adapter_name].quantile.data.fill_(float(threshold.item()))
+            else:
+                runtime.pending_init_threshold = float(threshold.item())
+
+            self._log_init_debug(adapter_name, threshold, x_mean, selected)
+            runtime.init_phase = False
+            runtime.init_done = True
+            self.clear_candidate_state(adapter_name)
+            if runtime.curr_count < total_budget:
+                self.refresh_candidate_batch(adapter_name)
+            return int(selected.numel())
+
         if self.candidate_indices[adapter_name].numel() == 0:
             self.refresh_candidate_batch(adapter_name)
 
         if self.grad_count.get(adapter_name, 0) < self.grad_store_steps[adapter_name]:
             return 0
 
-        self.sync_stage1_state(adapter_name)
         remaining_budget = total_budget - runtime.curr_count
         x_mean = self.compute_x_mean(adapter_name)
-        self.update_distribution(adapter_name, x_mean)
-        selected = self.select_location(adapter_name, x_mean, remaining_budget)
+        if runtime.pending_init_threshold is not None and self.threshold_mode[adapter_name] == "oracle" and runtime.refresh_rounds == 0:
+            threshold = torch.tensor(runtime.pending_init_threshold, device=x_mean.device, dtype=torch.float32)
+            runtime.pending_init_threshold = None
+        else:
+            self.update_distribution(adapter_name, x_mean)
+            threshold = self.search_quantile_estimator[adapter_name].get_quantile()
+        selected = self.select_location_with_threshold(adapter_name, x_mean, remaining_budget, threshold)
+        self._log_threshold_debug(adapter_name, threshold, x_mean, selected, remaining_budget)
         promoted = self.apply_stage1_promotions(adapter_name, selected)
+        runtime.refresh_rounds += 1
         self.clear_candidate_state(adapter_name)
         if runtime.curr_count < total_budget:
             self.refresh_candidate_batch(adapter_name)
@@ -330,6 +465,7 @@ class DSSLayer(BaseTunerLayer):
             )
         self.grad_cache[adapter_name].add_(candidate_grads)
         self.grad_count[adapter_name] += 1
+        self.runtime[adapter_name].total_steps += 1
 
     def get_candidate_grad_hook(self, adapter_name: str, candidate_indices: torch.Tensor):
         def hook(grad_delta: torch.Tensor) -> torch.Tensor:
@@ -368,6 +504,11 @@ class DSSLinear(nn.Module, DSSLayer):
         dropout: float = 0.0,
         quantile_lr: float = 0.01,
         quantile_alpha: float = 0.0,
+        threshold_log_every_steps: int = 1000,
+        init_enabled: bool = False,
+        init_steps: int = 10,
+        init_candidate_ratio: float = 0.05,
+        init_seed_mode: str = "threshold_only",
         fan_in_fan_out: bool = False,
         module_name: Optional[str] = None,
         **kwargs,
@@ -388,6 +529,11 @@ class DSSLinear(nn.Module, DSSLayer):
             dropout=dropout,
             quantile_lr=quantile_lr,
             quantile_alpha=quantile_alpha,
+            threshold_log_every_steps=threshold_log_every_steps,
+            init_enabled=init_enabled,
+            init_steps=init_steps,
+            init_candidate_ratio=init_candidate_ratio,
+            init_seed_mode=init_seed_mode,
             module_name=module_name,
         )
 
@@ -404,6 +550,11 @@ class DSSLinear(nn.Module, DSSLayer):
         dropout: float = 0.0,
         quantile_lr: float = 0.01,
         quantile_alpha: float = 0.0,
+        threshold_log_every_steps: int = 1000,
+        init_enabled: bool = False,
+        init_steps: int = 10,
+        init_candidate_ratio: float = 0.05,
+        init_seed_mode: str = "threshold_only",
         module_name: Optional[str] = None,
     ) -> None:
         resolved_low = self._resolve_bound(low, n_frequency)
@@ -429,12 +580,20 @@ class DSSLinear(nn.Module, DSSLayer):
         self.up[adapter_name] = resolved_up
         self.threshold_mode[adapter_name] = threshold_mode
         self.module_name[adapter_name] = module_name or ""
+        self.threshold_log_every_steps[adapter_name] = threshold_log_every_steps
+        self.init_enabled[adapter_name] = init_enabled
+        self.init_steps[adapter_name] = init_steps
+        self.init_candidate_ratio[adapter_name] = init_candidate_ratio
+        self.init_seed_mode[adapter_name] = init_seed_mode
         self.search_quantile_estimator[adapter_name] = GPUQuantileEstimator(
             target_quantile=1.0 - ratio,
             lr=quantile_lr,
             alpha=quantile_alpha,
             device=device,
         )
+        self.runtime[adapter_name].init_phase = init_enabled
+        self.runtime[adapter_name].init_done = not init_enabled
+        self.runtime[adapter_name].pending_init_threshold = None
         self.clear_candidate_state(adapter_name)
         self._move_adapter_to_device_of_base_layer(adapter_name)
         self.coefficient_indices[adapter_name] = self.coefficient_indices[adapter_name].to(device=device, dtype=torch.long)

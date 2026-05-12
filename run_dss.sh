@@ -55,6 +55,11 @@ THRESHOLD_MODE=${THRESHOLD_MODE:-"oracle"}
 DSS_DROPOUT=${DSS_DROPOUT:-0.05}
 QUANTILE_LR=${QUANTILE_LR:-0.01}
 QUANTILE_ALPHA=${QUANTILE_ALPHA:-0.0}
+THRESHOLD_LOG_EVERY_STEPS=${THRESHOLD_LOG_EVERY_STEPS:-1000}
+INIT_ENABLED=${INIT_ENABLED:-0}
+INIT_STEPS=${INIT_STEPS:-10}
+INIT_CANDIDATE_RATIO=${INIT_CANDIDATE_RATIO:-0.05}
+INIT_SEED_MODE=${INIT_SEED_MODE:-"threshold_only"}
 
 BATCH_SIZE=${BATCH_SIZE:-16}
 GRAD_ACCUM_STEPS=${GRAD_ACCUM_STEPS:-1}
@@ -148,6 +153,11 @@ cd "${REMOTE_PROJECT_ROOT}"
     echo "DSS_DROPOUT=${DSS_DROPOUT}"
     echo "QUANTILE_LR=${QUANTILE_LR}"
     echo "QUANTILE_ALPHA=${QUANTILE_ALPHA}"
+    echo "THRESHOLD_LOG_EVERY_STEPS=${THRESHOLD_LOG_EVERY_STEPS}"
+    echo "INIT_ENABLED=${INIT_ENABLED}"
+    echo "INIT_STEPS=${INIT_STEPS}"
+    echo "INIT_CANDIDATE_RATIO=${INIT_CANDIDATE_RATIO}"
+    echo "INIT_SEED_MODE=${INIT_SEED_MODE}"
     echo "BATCH_SIZE=${BATCH_SIZE}"
     echo "GRAD_ACCUM_STEPS=${GRAD_ACCUM_STEPS}"
     echo "NUM_EPOCHS=${NUM_EPOCHS}"
@@ -199,6 +209,10 @@ cmd=(
     --dropout "${DSS_DROPOUT}"
     --quantile_lr "${QUANTILE_LR}"
     --quantile_alpha "${QUANTILE_ALPHA}"
+    --threshold_log_every_steps "${THRESHOLD_LOG_EVERY_STEPS}"
+    --init_steps "${INIT_STEPS}"
+    --init_candidate_ratio "${INIT_CANDIDATE_RATIO}"
+    --init_seed_mode "${INIT_SEED_MODE}"
     --batch_size "${BATCH_SIZE}"
     --gradient_accumulation_steps "${GRAD_ACCUM_STEPS}"
     --num_epochs "${NUM_EPOCHS}"
@@ -216,6 +230,10 @@ cmd=(
     --run_name "${RUN_NAME}"
     --seed "${SEED}"
 )
+
+if [[ "${INIT_ENABLED}" == "1" ]]; then
+    cmd+=(--init_enabled)
+fi
 
 if [[ "${LOAD_BEST_MODEL_AT_END}" == "1" ]]; then
     cmd+=(--load_best_model_at_end)

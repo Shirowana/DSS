@@ -58,6 +58,11 @@ class DSSModel(BaseTuner):
             "dropout": dss_config.dropout,
             "quantile_lr": dss_config.quantile_lr,
             "quantile_alpha": dss_config.quantile_alpha,
+            "threshold_log_every_steps": dss_config.threshold_log_every_steps,
+            "init_enabled": dss_config.init_enabled,
+            "init_steps": dss_config.init_steps,
+            "init_candidate_ratio": dss_config.init_candidate_ratio,
+            "init_seed_mode": dss_config.init_seed_mode,
             "module_name": current_key,
             "fan_in_fan_out": dss_config.fan_in_fan_out,
         }
