@@ -3,11 +3,9 @@ from __future__ import annotations
 import warnings
 from dataclasses import asdict
 from enum import Enum
-from math import log
 from typing import Optional
 
 import torch
-import torch.nn as nn
 from tqdm import tqdm
 from transformers.pytorch_utils import Conv1D
 
@@ -20,68 +18,10 @@ from peft.utils import (
 
 from .config import DSSConfig
 from .layer import DSSLayer, DSSLinear
-from .shared_basis import SharedBasisPack
 
 
 class DSSModel(BaseTuner):
     prefix: str = "dss_"
-
-    def __init__(self, model, config, adapter_name, low_cpu_mem_usage: bool = False, state_dict=None) -> None:
-        primary_config = config[adapter_name] if isinstance(config, dict) else config
-        self.shared_basis_pack = SharedBasisPack.load(primary_config.shared_basis_path)
-        super().__init__(
-            model,
-            config,
-            adapter_name,
-            low_cpu_mem_usage=low_cpu_mem_usage,
-            state_dict=state_dict,
-        )
-
-    @staticmethod
-    def _group_scale_key(adapter_name: str, basis_group_name: str) -> str:
-        return f"{adapter_name}__{basis_group_name}"
-
-    def _get_or_create_group_scale_log(
-        self,
-        adapter_name: str,
-        basis_group_name: str,
-        device: Optional[torch.device] = None,
-    ) -> nn.Parameter:
-        if "group_scale_log" not in self.__dict__.get("_modules", {}):
-            self.group_scale_log = nn.ParameterDict()
-        key = self._group_scale_key(adapter_name, basis_group_name)
-        if key not in self.group_scale_log:
-            init = float(self.peft_config[adapter_name].group_scale_init)
-            parameter = nn.Parameter(torch.tensor(log(init), dtype=torch.float32, device=device))
-            self.group_scale_log[key] = parameter
-        return self.group_scale_log[key]
-
-    def export_group_scale_state(self, adapter_name: str) -> dict[str, torch.Tensor]:
-        exported: dict[str, torch.Tensor] = {}
-        for basis_group_name in self.peft_config[adapter_name].basis_group_map.keys():
-            key = self._group_scale_key(adapter_name, basis_group_name)
-            if key in self.group_scale_log:
-                exported[basis_group_name] = self.group_scale_log[key].detach().cpu().clone()
-        return exported
-
-    @torch.no_grad()
-    def restore_group_scale_state(
-        self,
-        adapter_name: str,
-        state: dict[str, torch.Tensor],
-    ) -> None:
-        target_device = None
-        for _module_name, layer, layer_adapter_name in self.active_dss_layers():
-            if layer_adapter_name == adapter_name:
-                target_device = layer.get_base_layer().weight.device
-                break
-        for basis_group_name, value in state.items():
-            parameter = self._get_or_create_group_scale_log(
-                adapter_name,
-                basis_group_name,
-                device=target_device,
-            )
-            parameter.copy_(value.to(device=parameter.device, dtype=parameter.dtype))
 
     def _check_new_adapter_config(self, config: DSSConfig) -> None:
         if (len(self.peft_config) > 1) and (config.bias != "none"):
@@ -93,16 +33,6 @@ class DSSModel(BaseTuner):
     @staticmethod
     def _check_target_module_exists(dss_config, key):
         return check_target_module_exists(dss_config, key)
-
-    def _resolve_basis_group(self, dss_config: DSSConfig, current_key: str) -> str:
-        for group_name, aliases in dss_config.basis_group_map.items():
-            for alias in aliases:
-                if current_key == alias or current_key.endswith(f".{alias}"):
-                    return group_name
-        raise ValueError(
-            f"Could not resolve a shared-basis group for module {current_key!r}. "
-            f"Available groups: {sorted(dss_config.basis_group_map.keys())}."
-        )
 
     def _create_and_replace(
         self,
@@ -117,9 +47,6 @@ class DSSModel(BaseTuner):
         if current_key is None:
             raise ValueError("Current key should not be None.")
 
-        basis_group_name = self._resolve_basis_group(dss_config, current_key)
-        shared_basis = self.shared_basis_pack.get(basis_group_name)
-        bias = hasattr(target, "bias") and target.bias is not None
         kwargs = {
             "n_frequency": dss_config.n_frequency,
             "candidate_size": dss_config.candidate_size,
@@ -127,45 +54,20 @@ class DSSModel(BaseTuner):
             "low": dss_config.low,
             "up": dss_config.up,
             "ratio": dss_config.ratio,
-            "stage2_enabled": dss_config.stage2_enabled,
-            "steady_stage_ratio": dss_config.steady_stage_ratio,
-            "update_interval": dss_config.update_interval,
-            "update_counts": dss_config.update_counts,
-            "update_margin": dss_config.update_margin,
-            "basis_group_name": basis_group_name,
-            "shared_basis": shared_basis,
-            "group_scale_log": self._get_or_create_group_scale_log(
-                adapter_name,
-                basis_group_name,
-                device=target.get_base_layer().weight.device if isinstance(target, BaseTunerLayer) else target.weight.device,
-            ),
+            "threshold_mode": dss_config.threshold_mode,
+            "dropout": dss_config.dropout,
+            "quantile_lr": dss_config.quantile_lr,
+            "quantile_alpha": dss_config.quantile_alpha,
+            "threshold_log_every_steps": dss_config.threshold_log_every_steps,
+            "init_enabled": dss_config.init_enabled,
+            "init_steps": dss_config.init_steps,
+            "init_candidate_ratio": dss_config.init_candidate_ratio,
+            "init_seed_mode": dss_config.init_seed_mode,
             "module_name": current_key,
             "fan_in_fan_out": dss_config.fan_in_fan_out,
-            "bias": bias,
         }
         if isinstance(target, DSSLayer):
-            target.update_layer(
-                adapter_name=adapter_name,
-                n_frequency=dss_config.n_frequency,
-                candidate_size=dss_config.candidate_size,
-                grad_store_steps=dss_config.grad_store_steps,
-                low=dss_config.low,
-                up=dss_config.up,
-                ratio=dss_config.ratio,
-                stage2_enabled=dss_config.stage2_enabled,
-                steady_stage_ratio=dss_config.steady_stage_ratio,
-                update_interval=dss_config.update_interval,
-                update_counts=dss_config.update_counts,
-                update_margin=dss_config.update_margin,
-                basis_group_name=basis_group_name,
-                shared_basis=shared_basis,
-                group_scale_log=self._get_or_create_group_scale_log(
-                    adapter_name,
-                    basis_group_name,
-                    device=target.get_base_layer().weight.device,
-                ),
-                module_name=current_key,
-            )
+            target.update_layer(adapter_name=adapter_name, **kwargs)
         else:
             new_module = self._create_new_module(dss_config, adapter_name, target, **kwargs)
             if adapter_name != self.active_adapter:
@@ -197,8 +99,6 @@ class DSSModel(BaseTuner):
     def _mark_only_adapters_as_trainable(self, model: torch.nn.Module) -> None:
         for parameter in model.parameters():
             parameter.requires_grad = False
-        for parameter in self.group_scale_log.parameters():
-            parameter.requires_grad = False
 
         for module in model.modules():
             if not isinstance(module, DSSLayer):
@@ -206,11 +106,6 @@ class DSSModel(BaseTuner):
             for active_adapter in module.active_adapters:
                 if active_adapter in module.coefficient:
                     module.coefficient[active_adapter].requires_grad_(True)
-        for active_adapter in self.active_adapters:
-            for basis_group_name in self.peft_config[active_adapter].basis_group_map.keys():
-                key = self._group_scale_key(active_adapter, basis_group_name)
-                if key in self.group_scale_log:
-                    self.group_scale_log[key].requires_grad_(True)
 
         for active_adapter in self.active_adapters:
             bias = self.peft_config[active_adapter].bias
@@ -298,68 +193,6 @@ class DSSModel(BaseTuner):
                 module.set_adapter(adapter_name)
         self.active_adapter = adapter_name
 
-    def active_dss_layers(self):
-        for module_name, module in self.model.named_modules():
-            if not isinstance(module, DSSLayer):
-                continue
-            for adapter_name in module.active_adapters:
-                if adapter_name in module.coefficient:
-                    yield module_name, module, adapter_name
-
-    def refresh_dss_layout(
-        self,
-        global_step: int,
-        total_steps: int,
-        optimizer=None,
-        grad_accumulation_steps: int = 1,
-    ) -> dict[str, int]:
-        summary = {
-            "stage1_refreshed_layers": 0,
-            "stage2_updated_layers": 0,
-            "promoted_slots": 0,
-            "pruned_slots": 0,
-            "grown_slots": 0,
-        }
-
-        for _module_name, layer, adapter_name in self.active_dss_layers():
-            report = layer.check_reinitiate(
-                adapter_name,
-                total_steps=total_steps,
-                global_step=global_step,
-            )
-            if report.refreshed:
-                summary["stage1_refreshed_layers"] += 1
-                summary["promoted_slots"] += int(report.promoted_slots)
-
-        for _module_name, layer, adapter_name in self.active_dss_layers():
-            report = layer.run_stage2_update(
-                adapter_name,
-                total_steps,
-                optimizer=optimizer,
-                grad_accumulation_steps=grad_accumulation_steps,
-            )
-            if report.updated:
-                summary["stage2_updated_layers"] += 1
-                summary["pruned_slots"] += int(report.pruned_slots)
-                summary["grown_slots"] += int(report.grown_slots)
-
-        for _module_name, layer, adapter_name in self.active_dss_layers():
-            layer.advance_update_state(adapter_name)
-
-        return summary
-
-        '''用法：
-        loss.backward()
-        optimizer.step()
-        layout_summary = model.refresh_dss_layout(
-            global_step=global_step,
-            total_steps=total_train_steps,
-            optimizer=optimizer,
-            grad_accumulation_steps=grad_accumulation_steps,
-        )
-        optimizer.zero_grad()
-        '''
-        
     @staticmethod
     def _prepare_adapter_config(peft_config, model_config):
         if peft_config.target_modules is None:
@@ -384,26 +217,22 @@ class DSSModel(BaseTuner):
                 parent, target, target_name = _get_submodules(self.model, key)
             except AttributeError:
                 continue
-
             if hasattr(target, "base_layer"):
                 if merge:
                     target.merge(safe_merge=safe_merge, adapter_names=adapter_names)
                 self._replace_module(parent, target_name, target.get_base_layer(), target)
             elif isinstance(target, ModulesToSaveWrapper):
                 setattr(parent, target_name, target.modules_to_save[target.active_adapter])
+
         return self.model
 
-    def merge_and_unload(
-        self,
-        progressbar: bool = False,
-        safe_merge: bool = False,
-        adapter_names: Optional[list[str]] = None,
-    ) -> torch.nn.Module:
+    def merge_and_unload(self, progressbar: bool = False, safe_merge: bool = False, adapter_names: Optional[list[str]] = None):
         return self._unload_and_optionally_merge(
+            merge=True,
             progressbar=progressbar,
             safe_merge=safe_merge,
             adapter_names=adapter_names,
         )
 
-    def unload(self) -> torch.nn.Module:
+    def unload(self):
         return self._unload_and_optionally_merge(merge=False)

@@ -52,7 +52,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--experiment_md", required=True)
     parser.add_argument("--eval_output_dir", required=True)
     parser.add_argument("--eval_log_file", default=None)
-    parser.add_argument("--experiment_root", default="/data/home/7250091/date/DSS/experiments/commonsense")
+    parser.add_argument("--experiment_root", default="/root/code/DSS/experiments/commonsense")
     return parser.parse_args()
 
 
