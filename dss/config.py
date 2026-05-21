@@ -37,6 +37,20 @@ class DSSConfig(PeftConfig):
         default="oracle",
         metadata={"help": "Threshold estimator mode. Supported values: `oracle`, `sgd`."},
     )
+    score_method: str = field(
+        default="abs_mean",
+        metadata={
+            "help": (
+                "Candidate importance score used before thresholding. Supported values: "
+                "`mean_abs`, `abs_mean`, `mean_square`, `rms_over_param`, "
+                "`abs_mean_over_param`, `snr`, `newton_like`."
+            )
+        },
+    )
+    score_eps: float = field(
+        default=1e-8,
+        metadata={"help": "Numerical stability constant used by score methods with a denominator."},
+    )
     dropout: float = field(
         default=0.0,
         metadata={"help": "Training-time dropout applied to elite DSS coefficients."},
@@ -50,7 +64,7 @@ class DSSConfig(PeftConfig):
         metadata={"help": "Reserved alpha parameter for the online quantile estimator."},
     )
     threshold_log_every_steps: int = field(
-        default=1000,
+        default=100,
         metadata={"help": "Print DSS threshold debug info on first refresh and then every N optimizer steps per layer."},
     )
     init_enabled: bool = field(
@@ -127,6 +141,22 @@ class DSSConfig(PeftConfig):
             raise ValueError("`ratio` must be in the open interval (0, 1).")
         if self.threshold_mode not in {"oracle", "sgd"}:
             raise ValueError("`threshold_mode` must be either `oracle` or `sgd`.")
+        if self.score_method not in {
+            "mean_abs",
+            "abs_mean",
+            "mean_square",
+            "rms_over_param",
+            "abs_mean_over_param",
+            "snr",
+            "newton_like",
+        }:
+            raise ValueError(
+                "`score_method` must be one of: "
+                "`mean_abs`, `abs_mean`, `mean_square`, `rms_over_param`, "
+                "`abs_mean_over_param`, `snr`, `newton_like`."
+            )
+        if self.score_eps <= 0.0:
+            raise ValueError("`score_eps` must be positive.")
         if not 0.0 <= self.dropout < 1.0:
             raise ValueError("`dropout` must be in the interval [0, 1).")
         if self.quantile_lr <= 0.0:

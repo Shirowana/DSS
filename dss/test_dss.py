@@ -140,6 +140,15 @@ assert spec.loader is not None
 spec.loader.exec_module(layer_module)
 DSSLinear = layer_module.DSSLinear
 
+SCORING_PATH = Path(__file__).with_name("scoring.py")
+scoring_spec = importlib.util.spec_from_file_location("peft.tuners.dss.scoring", SCORING_PATH)
+scoring_module = importlib.util.module_from_spec(scoring_spec)
+sys.modules["peft.tuners.dss.scoring"] = scoring_module
+assert scoring_spec.loader is not None
+scoring_spec.loader.exec_module(scoring_module)
+ScoreStats = scoring_module.ScoreStats
+compute_score = scoring_module.compute_score
+
 
 def dense_reference(layer: DSSLinear, adapter_name: str, x: torch.Tensor) -> torch.Tensor:
     delta = layer.get_delta_weight(adapter_name).to(layer.get_base_layer().weight.dtype)
@@ -237,6 +246,60 @@ class DSSLayerStageTests(unittest.TestCase):
         self.assertTrue(torch.equal(restored.coefficient_indices["default"][:2], exported["coefficient_indices"]))
         self.assertEqual(int(restored.elite_bitset["default"].sum().item()), 2)
         self.assertEqual(restored.grad_count["default"], 0)
+
+    def test_default_abs_mean_matches_legacy_formula(self):
+        layer = self.build_layer()
+        layer.grad_cache["default"] = torch.tensor([0.2, -0.8, 0.4], dtype=torch.float32)
+        layer.grad_count["default"] = 2
+
+        actual = layer.compute_x_mean("default")
+        expected = (layer.grad_cache["default"] / 2.0).abs()
+        self.assertTrue(torch.allclose(actual, expected, atol=1e-7, rtol=1e-7))
+
+
+class DSSScoringTests(unittest.TestCase):
+    def setUp(self):
+        self.stats = ScoreStats(
+            grad_sum=torch.tensor([2.0, -4.0], dtype=torch.float32),
+            abs_grad_sum=torch.tensor([4.0, 4.0], dtype=torch.float32),
+            grad_sq_sum=torch.tensor([6.0, 12.0], dtype=torch.float32),
+            count=2,
+        )
+        self.theta0_abs = torch.tensor([2.0, 4.0], dtype=torch.float32)
+
+    def test_score_methods_match_hand_computation(self):
+        mean_abs = compute_score("mean_abs", self.stats, self.theta0_abs)
+        abs_mean = compute_score("abs_mean", self.stats, self.theta0_abs)
+        mean_square = compute_score("mean_square", self.stats, self.theta0_abs)
+        rms_over_param = compute_score("rms_over_param", self.stats, self.theta0_abs)
+        abs_mean_over_param = compute_score("abs_mean_over_param", self.stats, self.theta0_abs)
+        snr = compute_score("snr", self.stats, self.theta0_abs)
+        newton_like = compute_score("newton_like", self.stats, self.theta0_abs)
+
+        self.assertTrue(torch.allclose(mean_abs, torch.tensor([2.0, 2.0])))
+        self.assertTrue(torch.allclose(abs_mean, torch.tensor([1.0, 2.0])))
+        self.assertTrue(torch.allclose(mean_square, torch.tensor([3.0, 6.0])))
+        self.assertTrue(torch.allclose(rms_over_param, torch.tensor([0.8660254, 0.6123724]), atol=1e-6))
+        self.assertTrue(torch.allclose(abs_mean_over_param, torch.tensor([0.5, 0.5])))
+        self.assertTrue(torch.allclose(snr, torch.tensor([0.70710677, 1.4142135]), atol=1e-6))
+        self.assertTrue(torch.allclose(newton_like, torch.tensor([0.33333334, 0.33333334]), atol=1e-6))
+
+    def test_snr_is_stable_for_zero_variance(self):
+        stats = ScoreStats(
+            grad_sum=torch.tensor([2.0], dtype=torch.float32),
+            abs_grad_sum=torch.tensor([2.0], dtype=torch.float32),
+            grad_sq_sum=torch.tensor([2.0], dtype=torch.float32),
+            count=2,
+        )
+        score = compute_score("snr", stats, torch.tensor([1.0]))
+        self.assertTrue(torch.isfinite(score).all())
+        self.assertGreater(score.item(), 0.0)
+
+    def test_denominator_based_scores_are_stable_for_zero_theta(self):
+        theta0_abs = torch.tensor([0.0, 0.0], dtype=torch.float32)
+        for method in ("rms_over_param", "abs_mean_over_param", "newton_like"):
+            score = compute_score(method, self.stats, theta0_abs, eps=1e-8)
+            self.assertTrue(torch.isfinite(score).all(), msg=method)
 
 
 if __name__ == "__main__":

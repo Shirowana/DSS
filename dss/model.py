@@ -55,6 +55,8 @@ class DSSModel(BaseTuner):
             "up": dss_config.up,
             "ratio": dss_config.ratio,
             "threshold_mode": dss_config.threshold_mode,
+            "score_method": dss_config.score_method,
+            "score_eps": dss_config.score_eps,
             "dropout": dss_config.dropout,
             "quantile_lr": dss_config.quantile_lr,
             "quantile_alpha": dss_config.quantile_alpha,
