@@ -571,11 +571,11 @@ class DSSLayer(BaseTunerLayer):
         self.runtime[adapter_name].total_steps += 1
 
     def get_candidate_grad_hook(self, adapter_name: str, candidate_indices: torch.Tensor):
-        def hook(grad_delta: torch.Tensor) -> torch.Tensor:
-            candidate_indices_device = candidate_indices.to(device=grad_delta.device, dtype=torch.long, non_blocking=True)
-            candidate_grads = grad_delta.reshape(-1).index_select(0, candidate_indices_device)
+        def hook(grad_merged_weight: torch.Tensor) -> torch.Tensor:
+            candidate_indices_device = candidate_indices.to(device=grad_merged_weight.device, dtype=torch.long, non_blocking=True)
+            candidate_grads = grad_merged_weight.reshape(-1).index_select(0, candidate_indices_device)
             self.collect_candidate_grads(adapter_name, candidate_grads)
-            return grad_delta
+            return grad_merged_weight
 
         return hook
 
@@ -591,6 +591,26 @@ class DSSLayer(BaseTunerLayer):
     def merge_(self, adapter_name: str) -> None:
         delta_weight = self.get_delta_weight(adapter_name).to(self.get_base_layer().weight.dtype)
         self.get_base_layer().weight.data.add_(delta_weight)
+
+    def _build_merged_weight_for_forward(self, adapter_names: list[str], dtype: torch.dtype) -> torch.Tensor:
+        """Build a dense merged weight for the hot forward path.
+
+        This path favors speed/memory and uses the base weight dtype; an fp32
+        merge would preserve tiny updates better but costs more memory/time.
+        """
+
+        base_weight = self.get_base_layer().weight.detach().to(dtype=dtype)
+        base_flat = base_weight.reshape(-1)
+        merged_flat = base_flat.clone()
+        for adapter_name in adapter_names:
+            curr_count = self.runtime[adapter_name].curr_count
+            if curr_count == 0:
+                continue
+            elite_indices = self.coefficient_indices[adapter_name][:curr_count].long()
+            elite_values = self.dropout_layer[adapter_name](self.coefficient[adapter_name][:curr_count])
+            elite_values = elite_values.to(dtype=base_flat.dtype)
+            merged_flat = merged_flat.scatter_add(0, elite_indices, elite_values)
+        return merged_flat.view_as(base_weight)
 
 
 class DSSLinear(nn.Module, DSSLayer):
@@ -783,31 +803,53 @@ class DSSLinear(nn.Module, DSSLayer):
                 if active_adapter in self.coefficient:
                     self.maybe_refresh_stage1(active_adapter)
 
-        result = self.base_layer(x, *args, **kwargs)
+        active_dss_adapters: list[str] = []
         for active_adapter in self.active_adapters:
             if active_adapter not in self.coefficient:
                 continue
             curr_count = self.runtime[active_adapter].curr_count
             candidate_indices = self.candidate_indices[active_adapter]
-            if curr_count == 0 and candidate_indices.numel() == 0:
-                continue
+            if curr_count > 0 or candidate_indices.numel() > 0:
+                active_dss_adapters.append(active_adapter)
 
-            delta_dtype = self.get_base_layer().weight.dtype
-            delta_flat = x.new_zeros(self.out_features * self.in_features, dtype=delta_dtype)
-            if curr_count > 0:
-                elite_values = self.dropout_layer[active_adapter](self.coefficient[active_adapter][:curr_count])
-                elite_values = elite_values.to(dtype=delta_flat.dtype)
-                elite_indices = self.coefficient_indices[active_adapter][:curr_count].long()
-                delta_flat = delta_flat.scatter_add(0, elite_indices, elite_values)
-            delta_weight = delta_flat.view(self.out_features, self.in_features)
+        if not active_dss_adapters:
+            return self.base_layer(x, *args, **kwargs).to(previous_dtype)
 
-            if self.training and candidate_indices.numel() > 0:
-                if not delta_weight.requires_grad:
-                    delta_weight.requires_grad_(True)
-                delta_weight.register_hook(self.get_candidate_grad_hook(active_adapter, candidate_indices))
+        base_layer = self.get_base_layer()
+        weight_dtype = base_layer.weight.dtype
+        merged_weight = self._build_merged_weight_for_forward(active_dss_adapters, dtype=weight_dtype)
+        candidate_probe_present = False
+        has_active_elite = False
 
-            x_cast = self._cast_input_dtype(x, delta_weight.dtype)
-            result = result + F.linear(x_cast, delta_weight, bias=None).to(dtype=result.dtype)
+        for active_adapter in active_dss_adapters:
+            curr_count = self.runtime[active_adapter].curr_count
+            candidate_indices = self.candidate_indices[active_adapter]
+            candidate_probe_present = candidate_probe_present or candidate_indices.numel() > 0
+            has_active_elite = has_active_elite or curr_count > 0
+
+        if not has_active_elite and candidate_probe_present:
+            zero_dep = self.coefficient[active_dss_adapters[0]][:0].sum().to(dtype=merged_weight.dtype) * 0.0
+            merged_weight = merged_weight + zero_dep
+
+        if self.training:
+            for active_adapter in active_dss_adapters:
+                candidate_indices = self.candidate_indices[active_adapter]
+                if candidate_indices.numel() > 0:
+                    merged_weight.register_hook(self.get_candidate_grad_hook(active_adapter, candidate_indices))
+
+        x_cast = self._cast_input_dtype(x, merged_weight.dtype)
+        if isinstance(base_layer, nn.Linear):
+            result = F.linear(x_cast, merged_weight, bias=base_layer.bias)
+        elif isinstance(base_layer, Conv1D):
+            # Conv1D uses the native HF layout: weight shape is [in_features, out_features].
+            size_out = x_cast.size()[:-1] + (base_layer.nf,)
+            bias = base_layer.bias
+            if bias is None:
+                bias = torch.zeros(base_layer.nf, device=x_cast.device, dtype=merged_weight.dtype)
+            result = torch.addmm(bias, x_cast.reshape(-1, x_cast.size(-1)), merged_weight)
+            result = result.view(size_out)
+        else:
+            raise ValueError(f"Unsupported layer type {type(base_layer)}")
 
         return result.to(previous_dtype)
 
