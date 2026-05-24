@@ -125,6 +125,7 @@ class DSSLayer(BaseTunerLayer):
         self.low: dict[str, int] = {}
         self.up: dict[str, int] = {}
         self.threshold_mode: dict[str, str] = {}
+        self.threshold_log_every_steps: dict[str, int] = {}
         self.score_method: dict[str, str] = {}
         self.score_eps: dict[str, float] = {}
         self.module_name: dict[str, str] = {}
@@ -418,6 +419,42 @@ class DSSLayer(BaseTunerLayer):
             selected = torch.argsort(x_mean.float(), descending=True)[:remaining_budget]
         return selected
 
+    @torch.no_grad()
+    def maybe_log_threshold_health(
+        self,
+        adapter_name: str,
+        x_mean: torch.Tensor,
+        threshold: torch.Tensor,
+        selected: torch.Tensor,
+    ) -> None:
+        if _dist_rank() != 0 or x_mean.numel() == 0:
+            return
+
+        runtime = self.runtime[adapter_name]
+        log_every = self.threshold_log_every_steps.get(adapter_name, 100)
+        step = int(runtime.total_steps)
+        if runtime.last_logged_step >= 0 and step - runtime.last_logged_step < log_every:
+            return
+
+        scores = x_mean.reshape(-1).float()
+        threshold_value = float(threshold.detach().float().item())
+        threshold_selected = int((scores > threshold).sum().item())
+        module_name = self.module_name.get(adapter_name, "") or "<unknown>"
+        print(
+            f"[DSS threshold] module={module_name} "
+            f"score_method={self.score_method[adapter_name]} "
+            f"step={step} "
+            f"refresh={runtime.refresh_rounds + 1} "
+            f"threshold={threshold_value:.8f} "
+            f"score_min={float(scores.min().item()):.8f} "
+            f"score_mean={float(scores.mean().item()):.8f} "
+            f"score_max={float(scores.max().item()):.8f} "
+            f"threshold_selected={threshold_selected} "
+            f"final_selected={int(selected.numel())}",
+            flush=True,
+        )
+        runtime.last_logged_step = step
+
     def apply_stage1_promotions(self, adapter_name: str, selected: torch.Tensor) -> int:
         if selected.numel() == 0:
             return 0
@@ -485,6 +522,7 @@ class DSSLayer(BaseTunerLayer):
             self.update_distribution(adapter_name, x_mean)
             threshold = self.search_quantile_estimator[adapter_name].get_quantile()
         selected = self.select_location_with_threshold(adapter_name, x_mean, remaining_budget, threshold)
+        self.maybe_log_threshold_health(adapter_name, x_mean, threshold, selected)
         selected = self._sync_selected_locations(selected, x_mean.device)
         promoted = self.apply_stage1_promotions(adapter_name, selected)
         runtime.refresh_rounds += 1
@@ -655,6 +693,7 @@ class DSSLinear(nn.Module, DSSLayer):
         self.low[adapter_name] = resolved_low
         self.up[adapter_name] = resolved_up
         self.threshold_mode[adapter_name] = threshold_mode
+        self.threshold_log_every_steps[adapter_name] = int(threshold_log_every_steps)
         self.score_method[adapter_name] = score_method
         self.score_eps[adapter_name] = score_eps
         self.module_name[adapter_name] = module_name or ""

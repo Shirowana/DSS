@@ -82,10 +82,25 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--up", type=float, default=4.0)
     parser.add_argument("--ratio", type=float, default=0.1)
     parser.add_argument("--threshold_mode", type=str, default="oracle", choices=["oracle", "sgd"])
+    parser.add_argument(
+        "--score_method",
+        type=str,
+        default="abs_mean",
+        choices=[
+            "mean_abs",
+            "abs_mean",
+            "mean_square",
+            "rms_over_param",
+            "abs_mean_over_param",
+            "snr",
+            "newton_like",
+        ],
+    )
+    parser.add_argument("--score_eps", type=float, default=1e-8)
     parser.add_argument("--dropout", type=float, default=0.0)
     parser.add_argument("--quantile_lr", type=float, default=0.01)
     parser.add_argument("--quantile_alpha", type=float, default=0.0)
-    parser.add_argument("--threshold_log_every_steps", type=int, default=1000)
+    parser.add_argument("--threshold_log_every_steps", type=int, default=100)
     parser.add_argument("--init_enabled", action="store_true")
     parser.add_argument("--init_steps", type=int, default=10)
     parser.add_argument("--init_candidate_ratio", type=float, default=0.05)
@@ -613,6 +628,8 @@ def main() -> None:
         up=args.up,
         ratio=args.ratio,
         threshold_mode=args.threshold_mode,
+        score_method=args.score_method,
+        score_eps=args.score_eps,
         dropout=args.dropout,
         quantile_lr=args.quantile_lr,
         quantile_alpha=args.quantile_alpha,

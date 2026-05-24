@@ -134,6 +134,17 @@ def compute_score(
             return _empty_like_reference(stats, theta0_abs)
         return (stats.grad_sum / count).abs().float()
 
+    if method == ABS_MEAN_OVER_PARAM:
+        if (
+            stats.grad_sum is None
+            or stats.grad_sum.numel() == 0
+            or theta0_abs is None
+            or theta0_abs.numel() == 0
+        ):
+            return _empty_like_reference(stats, theta0_abs)
+        abs_mean = (stats.grad_sum / count).abs().float()
+        return abs_mean / (theta0_abs.float() + eps)
+
     if stats.grad_sq_sum is None or stats.grad_sq_sum.numel() == 0:
         return _empty_like_reference(stats, theta0_abs)
 
@@ -142,24 +153,28 @@ def compute_score(
     if method == MEAN_SQUARE:
         return mean_square
 
-    if theta0_abs is None or theta0_abs.numel() == 0:
-        return _empty_like_reference(stats, theta0_abs)
-    denom_param = theta0_abs.float() + eps
-
-    if method == RMS_OVER_PARAM:
-        return torch.sqrt(mean_square) / denom_param
-
     if stats.grad_sum is None or stats.grad_sum.numel() == 0:
+        if method == RMS_OVER_PARAM:
+            # RMS-over-parameter only needs the second moment and |theta0|.
+            if theta0_abs is None or theta0_abs.numel() == 0:
+                return _empty_like_reference(stats, theta0_abs)
+            return torch.sqrt(mean_square) / (theta0_abs.float() + eps)
         return _empty_like_reference(stats, theta0_abs)
 
     abs_mean = (stats.grad_sum / count).abs().float()
-
-    if method == ABS_MEAN_OVER_PARAM:
-        return abs_mean / denom_param
 
     if method == SNR:
         variance = torch.clamp(mean_square - abs_mean.square(), min=0.0)
         std = torch.sqrt(variance)
         return abs_mean / (std + eps)
 
-    return abs_mean / (mean_square + eps)
+    if method == NEWTON_LIKE:
+        return abs_mean / (mean_square + eps)
+
+    if method == RMS_OVER_PARAM:
+        if theta0_abs is None or theta0_abs.numel() == 0:
+            return _empty_like_reference(stats, theta0_abs)
+        denom_param = theta0_abs.float() + eps
+        return torch.sqrt(mean_square) / denom_param
+
+    raise ValueError(f"Unsupported DSS score method: {method!r}")
