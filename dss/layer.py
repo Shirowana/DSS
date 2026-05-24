@@ -259,8 +259,9 @@ class DSSLayer(BaseTunerLayer):
         if sampled.numel() == 0 or not self._score_requires_theta0_abs(adapter_name):
             self.theta0_abs_cache[adapter_name] = None
             return
-        base_weight_abs = self.get_base_layer().weight.detach().reshape(-1).abs()
-        self.theta0_abs_cache[adapter_name] = base_weight_abs.index_select(0, sampled.long()).to(
+        base_weight_flat = self.get_base_layer().weight.detach().reshape(-1)
+        theta0 = base_weight_flat.index_select(0, sampled.long())
+        self.theta0_abs_cache[adapter_name] = theta0.abs().to(
             device=device, dtype=torch.float32
         )
 
@@ -268,7 +269,8 @@ class DSSLayer(BaseTunerLayer):
         device = self._adapter_device(adapter_name)
         dense_numel = self.out_features * self.in_features
         elite_bitset = self.elite_bitset[adapter_name] if _elite_bitset_enabled() else None
-        available = dense_numel - int(elite_bitset.sum().item()) if elite_bitset is not None else dense_numel
+        runtime = self.runtime[adapter_name]
+        available = dense_numel - runtime.curr_count if elite_bitset is not None else dense_numel
         target_k = min(self.candidate_size[adapter_name], max(available, 0))
         if target_k <= 0:
             self.clear_candidate_state(adapter_name)
@@ -277,13 +279,20 @@ class DSSLayer(BaseTunerLayer):
         sampled = torch.empty(0, device=device, dtype=torch.long)
         if _dist_rank() == 0:
             sample_k = max(target_k * 4, target_k)
-            while sampled.numel() < target_k:
+            proposal_chunks = []
+            while True:
                 proposal = torch.randint(0, dense_numel, (sample_k,), device=device)
                 proposal = torch.unique(proposal)
                 if elite_bitset is not None:
                     proposal = proposal[~elite_bitset[proposal]]
-                sampled = torch.unique(torch.cat([sampled, proposal], dim=0))
-                if sampled.numel() >= target_k or sampled.numel() >= available:
+                if proposal.numel() > 0:
+                    proposal_chunks.append(proposal)
+                buffered = sum(chunk.numel() for chunk in proposal_chunks)
+                if buffered >= target_k or buffered >= available or sample_k >= dense_numel:
+                    if proposal_chunks:
+                        sampled = torch.unique(torch.cat(proposal_chunks, dim=0))
+                    break
+                if buffered == 0 and sample_k >= dense_numel:
                     break
                 sample_k = min(dense_numel, max(sample_k * 2, target_k))
             sampled = sampled[:target_k]
@@ -400,11 +409,11 @@ class DSSLayer(BaseTunerLayer):
         num_candidates = int(candidate_mask.sum().item())
 
         if num_candidates > real_up:
-            return torch.argsort(x_mean.float(), descending=True)[:real_up]
+            return torch.topk(x_mean.float(), k=real_up, largest=True, sorted=False).indices
         if num_candidates < real_low:
             if real_low == 0:
                 return torch.empty(0, device=x_mean.device, dtype=torch.long)
-            return torch.argsort(x_mean.float(), descending=True)[:real_low]
+            return torch.topk(x_mean.float(), k=real_low, largest=True, sorted=False).indices
         return torch.nonzero(candidate_mask, as_tuple=True)[0]
 
     def select_location(self, adapter_name: str, x_mean: torch.Tensor, remaining_budget: int) -> torch.Tensor:
@@ -416,7 +425,7 @@ class DSSLayer(BaseTunerLayer):
             return torch.empty(0, device=x_mean.device, dtype=torch.long)
         selected = torch.nonzero(x_mean.float() > threshold, as_tuple=True)[0]
         if selected.numel() > remaining_budget:
-            selected = torch.argsort(x_mean.float(), descending=True)[:remaining_budget]
+            selected = torch.topk(x_mean.float(), k=remaining_budget, largest=True, sorted=False).indices
         return selected
 
     @torch.no_grad()

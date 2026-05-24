@@ -163,145 +163,6 @@ def count_parameters(model) -> tuple[int, int]:
     return total, trainable
 
 
-def register_post_attn_norm_debug_hooks(model):
-    target_modules = {
-        "base_model.model.model.layers.10.post_attention_layernorm": "model.layers.10.post_attention_layernorm",
-        "base_model.model.model.layers.11.post_attention_layernorm": "model.layers.11.post_attention_layernorm",
-        "base_model.model.model.layers.12.post_attention_layernorm": "model.layers.12.post_attention_layernorm",
-    }
-    stats = {alias: {"sum": 0.0, "count": 0} for alias in target_modules.values()}
-    hooks = []
-
-    def make_hook(alias: str):
-        def hook(_module, _inputs, output):
-            if not torch.is_tensor(output):
-                return
-            stats[alias]["sum"] += float(output.detach().float().abs().mean().item())
-            stats[alias]["count"] += 1
-
-        return hook
-
-    for module_name, module in model.named_modules():
-        alias = target_modules.get(module_name)
-        if alias is not None:
-            hooks.append(module.register_forward_hook(make_hook(alias)))
-
-    return hooks, stats
-
-
-def register_post_attn_norm_input_debug_hooks(model):
-    target_modules = {
-        "base_model.model.model.layers.10.post_attention_layernorm": "model.layers.10.post_attention_layernorm_input",
-        "base_model.model.model.layers.11.post_attention_layernorm": "model.layers.11.post_attention_layernorm_input",
-        "base_model.model.model.layers.12.post_attention_layernorm": "model.layers.12.post_attention_layernorm_input",
-    }
-    stats = {alias: {"sum": 0.0, "count": 0} for alias in target_modules.values()}
-    hooks = []
-
-    def make_hook(alias: str):
-        def hook(_module, inputs):
-            if not inputs:
-                return
-            tensor = inputs[0]
-            if not torch.is_tensor(tensor):
-                return
-            stats[alias]["sum"] += float(tensor.detach().float().abs().mean().item())
-            stats[alias]["count"] += 1
-
-        return hook
-
-    for module_name, module in model.named_modules():
-        alias = target_modules.get(module_name)
-        if alias is not None:
-            hooks.append(module.register_forward_pre_hook(make_hook(alias)))
-
-    return hooks, stats
-
-
-def register_attn_oproj_debug_hooks(model):
-    target_modules = {
-        "base_model.model.model.layers.10.self_attn.o_proj": "model.layers.10.self_attn.o_proj",
-        "base_model.model.model.layers.11.self_attn.o_proj": "model.layers.11.self_attn.o_proj",
-        "base_model.model.model.layers.12.self_attn.o_proj": "model.layers.12.self_attn.o_proj",
-    }
-    stats = {alias: {"sum": 0.0, "count": 0} for alias in target_modules.values()}
-    hooks = []
-
-    def make_hook(alias: str):
-        def hook(_module, _inputs, output):
-            if not torch.is_tensor(output):
-                return
-            stats[alias]["sum"] += float(output.detach().float().abs().mean().item())
-            stats[alias]["count"] += 1
-
-        return hook
-
-    for module_name, module in model.named_modules():
-        alias = target_modules.get(module_name)
-        if alias is not None:
-            hooks.append(module.register_forward_hook(make_hook(alias)))
-
-    return hooks, stats
-
-
-def print_wrap_debug(model) -> None:
-    target_modules = {
-        "base_model.model.model.layers.10.self_attn.o_proj",
-        "base_model.model.model.layers.10.mlp.up_proj",
-        "base_model.model.model.layers.10.mlp.down_proj",
-        "base_model.model.model.layers.11.self_attn.o_proj",
-        "base_model.model.model.layers.11.mlp.up_proj",
-        "base_model.model.model.layers.11.mlp.down_proj",
-        "base_model.model.model.layers.12.self_attn.o_proj",
-        "base_model.model.model.layers.12.mlp.up_proj",
-        "base_model.model.model.layers.12.mlp.down_proj",
-    }
-    found = {}
-    for module_name, module in model.named_modules():
-        if module_name not in target_modules:
-            continue
-        module_type = type(module).__name__
-        if isinstance(module, DSSLayer):
-            base_type = type(module.get_base_layer()).__name__
-            module_tag = module.module_name.get(next(iter(module.active_adapters)), "")
-            found[module_name] = f"type={module_type} base_type={base_type} dss_module_name={module_tag}"
-        else:
-            found[module_name] = f"type={module_type}"
-
-    for module_name in sorted(target_modules):
-        detail = found.get(module_name, "MISSING")
-        print(f"[DSS wrap] module={module_name} {detail}", flush=True)
-
-
-def print_require_grad_debug(model) -> None:
-    target_modules = {
-        "base_model.model.model.layers.10.mlp.up_proj",
-        "base_model.model.model.layers.10.mlp.down_proj",
-        "base_model.model.model.layers.12.mlp.up_proj",
-        "base_model.model.model.layers.12.mlp.down_proj",
-    }
-    for module_name, module in model.named_modules():
-        if module_name not in target_modules:
-            continue
-        if not isinstance(module, DSSLayer):
-            print(f"[DSS grad] module={module_name} type={type(module).__name__} unexpected_non_dss=1", flush=True)
-            continue
-        active_adapter = next(iter(module.active_adapters))
-        base_layer = module.get_base_layer()
-        base_weight_requires_grad = getattr(base_layer.weight, "requires_grad", None)
-        coeff_requires_grad = module.coefficient[active_adapter].requires_grad
-        coeff_dtype = module.coefficient[active_adapter].dtype
-        base_dtype = base_layer.weight.dtype
-        print(
-            f"[DSS grad] module={module_name} "
-            f"base_weight_requires_grad={base_weight_requires_grad} "
-            f"base_weight_dtype={base_dtype} "
-            f"coefficient_requires_grad={coeff_requires_grad} "
-            f"coefficient_dtype={coeff_dtype}",
-            flush=True,
-        )
-
-
 def resolve_train_dataset(dataset_obj) -> Dataset:
     if isinstance(dataset_obj, Dataset):
         return dataset_obj
@@ -651,14 +512,6 @@ def main() -> None:
         device = torch.device("cpu")
     model.to(device)
     model.train()
-    norm_debug_hooks, norm_debug_stats = register_post_attn_norm_debug_hooks(model) if local_rank in (-1, 0) else ([], {})
-    norm_input_debug_hooks, norm_input_debug_stats = (
-        register_post_attn_norm_input_debug_hooks(model) if local_rank in (-1, 0) else ([], {})
-    )
-    attn_debug_hooks, attn_debug_stats = register_attn_oproj_debug_hooks(model) if local_rank in (-1, 0) else ([], {})
-    if local_rank in (-1, 0):
-        print_wrap_debug(model)
-        print_require_grad_debug(model)
 
     total_params, trainable_params = count_parameters(model)
     print(f"Total params: {total_params:,} | Trainable: {trainable_params:,} ({100 * trainable_params / total_params:.4f}%)")
@@ -818,27 +671,6 @@ def main() -> None:
         )
     with maybe_hide_unsafe_resume_state(args.resume_from_checkpoint):
         trainer.train(resume_from_checkpoint=args.resume_from_checkpoint or None)
-    if local_rank in (-1, 0) and norm_debug_stats:
-        for module_name, values in norm_debug_stats.items():
-            if values["count"] > 0:
-                mean_value = values["sum"] / float(values["count"])
-                print(f"[DSS norm] module={module_name} abs_mean={mean_value:.8f}", flush=True)
-    if local_rank in (-1, 0) and norm_input_debug_stats:
-        for module_name, values in norm_input_debug_stats.items():
-            if values["count"] > 0:
-                mean_value = values["sum"] / float(values["count"])
-                print(f"[DSS norm-input] module={module_name} abs_mean={mean_value:.8f}", flush=True)
-    if local_rank in (-1, 0) and attn_debug_stats:
-        for module_name, values in attn_debug_stats.items():
-            if values["count"] > 0:
-                mean_value = values["sum"] / float(values["count"])
-                print(f"[DSS attn] module={module_name} abs_mean={mean_value:.8f}", flush=True)
-    for hook in norm_debug_hooks:
-        hook.remove()
-    for hook in norm_input_debug_hooks:
-        hook.remove()
-    for hook in attn_debug_hooks:
-        hook.remove()
     trainer.save_model(str(output_dir))
     print(f"Training complete. Adapter saved to {output_dir}")
 
