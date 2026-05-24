@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import hashlib
+import math
 import os
 import warnings
 from dataclasses import dataclass
@@ -26,6 +28,9 @@ class SearchRuntime:
     init_phase: bool = False
     init_done: bool = False
     pending_init_threshold: Optional[float] = None
+    perm_cursor: int = 0
+    perm_round: int = 0
+    perm_seed: int = 0
 
 
 def _dist_ready() -> bool:
@@ -42,18 +47,6 @@ def _dist_world_size() -> int:
 
 def _ddp_sampling_sync_enabled() -> bool:
     return os.environ.get("DSS_DISABLE_DDP_CANDIDATE_SYNC", "0") != "1"
-
-
-def _elite_bitset_enabled() -> bool:
-    """Debug switch for isolating dense bitset memory from the rest of DSS.
-
-    The bitset normally prevents future candidate batches from re-sampling
-    positions that already entered the elite pool. Disabling it is only meant
-    for short memory probes: duplicate elite positions may be selected, so the
-    resulting run should not be treated as a valid training experiment.
-    """
-
-    return os.environ.get("DSS_DISABLE_ELITE_BITSET", "0") != "1"
 
 
 class GPUQuantileEstimator:
@@ -103,14 +96,13 @@ class GPUQuantileEstimator:
 
 class DSSLayer(BaseTunerLayer):
     adapter_layer_names = ("coefficient",)
-    other_param_names = ("coefficient_indices", "candidate_indices", "elite_bitset", "dropout_layer")
+    other_param_names = ("coefficient_indices", "candidate_indices", "dropout_layer")
 
     def __init__(self, base_layer: nn.Module, **kwargs) -> None:
         self.base_layer = base_layer
         self.coefficient = nn.ParameterDict({})
         self.coefficient_indices = BufferDict({})
         self.candidate_indices = BufferDict({})
-        self.elite_bitset = BufferDict({})
         self.dropout_layer = nn.ModuleDict({})
         self._disable_adapters = False
         self.merged_adapters = []
@@ -159,6 +151,140 @@ class DSSLayer(BaseTunerLayer):
         self.grad_sq_sum[adapter_name] = None
         self.theta0_abs_cache[adapter_name] = None
 
+    @staticmethod
+    def _stable_u64_seed(
+        module_name: str,
+        adapter_name: str,
+        rows: int,
+        cols: int,
+        perm_round: int,
+    ) -> int:
+        payload = f"{module_name}|{adapter_name}|{rows}|{cols}|{perm_round}".encode("utf-8")
+        digest = hashlib.blake2b(payload, digest_size=8).digest()
+        return int.from_bytes(digest, byteorder="little", signed=False) & ((1 << 63) - 1)
+
+    @staticmethod
+    def _pick_coprime_multiplier(modulus: int, seed: int) -> int:
+        if modulus <= 1:
+            return 1
+        candidate = (seed % modulus) | 1
+        if candidate == 0:
+            candidate = 1
+        while math.gcd(candidate, modulus) != 1:
+            candidate += 2
+            if candidate >= modulus:
+                candidate = candidate % modulus
+                if candidate == 0:
+                    candidate = 1
+                candidate |= 1
+        return candidate
+
+    @staticmethod
+    def _affine_permute_scalar_or_tensor(
+        x: torch.Tensor | int,
+        modulus: int,
+        a: int,
+        b: int,
+    ) -> torch.Tensor:
+        if isinstance(x, torch.Tensor):
+            return torch.remainder(x * a + b, modulus)
+        return torch.tensor((a * x + b) % modulus, dtype=torch.long)
+
+    @staticmethod
+    def _feistel_permute_pow2(
+        x: torch.Tensor,
+        bits: int,
+        seed: int | torch.Tensor,
+        rounds: int = 4,
+    ) -> torch.Tensor:
+        if bits <= 0 or bits % 2 != 0:
+            raise ValueError("Feistel permutation expects a positive even bit width.")
+
+        x = x.to(dtype=torch.long)
+        half_bits = bits // 2
+        half_mask = (1 << half_bits) - 1
+        left = (x >> half_bits) & half_mask
+        right = x & half_mask
+        if isinstance(seed, torch.Tensor):
+            seed_tensor = seed.to(device=x.device, dtype=torch.long)
+        else:
+            seed_tensor = torch.full_like(x, int(seed), dtype=torch.long)
+
+        round_mask = (1 << 61) - 1
+        for round_idx in range(rounds):
+            mixed = (right ^ seed_tensor ^ ((round_idx + 1) * 0x9E3779B1)) & round_mask
+            mixed = (mixed ^ (mixed >> 7)) & round_mask
+            mixed = (mixed * 0x45D9F3B) & round_mask
+            mixed = (mixed ^ (mixed >> 11)) & round_mask
+            mixed = (mixed + (right << (round_idx + 1)) + ((round_idx + 1) * 0x27D4EB2F)) & round_mask
+            f_val = mixed & half_mask
+            left, right = right, (left ^ f_val) & half_mask
+        return ((left << half_bits) | right).to(dtype=torch.long)
+
+    def _set_permutation_round(self, adapter_name: str, perm_round: int) -> None:
+        runtime = self.runtime[adapter_name]
+        runtime.perm_round = int(perm_round)
+        runtime.perm_cursor = 0
+        runtime.perm_seed = self._stable_u64_seed(
+            self.module_name.get(adapter_name, ""),
+            adapter_name,
+            self.out_features,
+            self.in_features,
+            runtime.perm_round,
+        )
+
+    def _make_blockwise_permutation_indices(
+        self,
+        t: torch.Tensor,
+        adapter_name: str,
+        perm_round: int,
+        device: torch.device,
+    ) -> torch.Tensor:
+        del perm_round
+        block_size = 64
+        rows, cols = self.out_features, self.in_features
+        block_rows = rows // block_size
+        block_cols = cols // block_size
+        num_blocks = block_rows * block_cols
+        block_area = block_size * block_size
+        round_seed = self.runtime[adapter_name].perm_seed
+        block_a = self._pick_coprime_multiplier(num_blocks, round_seed ^ 0x9E3779B1)
+        block_b = (round_seed ^ 0x85EBCA77) % num_blocks
+
+        block_rank = torch.remainder(t, num_blocks)
+        local_rank = torch.div(t, num_blocks, rounding_mode="floor")
+        block_id = self._affine_permute_scalar_or_tensor(block_rank, num_blocks, block_a, block_b)
+        local_rank = torch.remainder(local_rank, block_area)
+        local_seed = torch.remainder(
+            block_id * 0x9E3779B1 + (round_seed & ((1 << 31) - 1)),
+            1 << 62,
+        )
+        local_id = self._feistel_permute_pow2(local_rank, bits=12, seed=local_seed, rounds=4)
+
+        block_row = torch.div(block_id, block_cols, rounding_mode="floor")
+        block_col = torch.remainder(block_id, block_cols)
+        local_row = torch.div(local_id, block_size, rounding_mode="floor")
+        local_col = torch.remainder(local_id, block_size)
+
+        row = block_row * block_size + local_row
+        col = block_col * block_size + local_col
+        return (row * cols + col).to(device=device, dtype=torch.long)
+
+    def _make_flat_permutation_indices(
+        self,
+        t: torch.Tensor,
+        adapter_name: str,
+        perm_round: int,
+        device: torch.device,
+    ) -> torch.Tensor:
+        del perm_round
+        dense_numel = self.out_features * self.in_features
+        round_seed = self.runtime[adapter_name].perm_seed
+        a_flat = self._pick_coprime_multiplier(dense_numel, round_seed ^ 0xC2B2AE3D)
+        b_flat = (round_seed ^ 0x27D4EB2F) % dense_numel
+        sampled = self._affine_permute_scalar_or_tensor(t, dense_numel, a_flat, b_flat)
+        return sampled.to(device=device, dtype=torch.long)
+
     @torch.no_grad()
     def export_sparse_checkpoint(self, adapter_name: str) -> dict[str, torch.Tensor]:
         curr_count = self.runtime[adapter_name].curr_count
@@ -198,13 +324,8 @@ class DSSLayer(BaseTunerLayer):
             coeff_param.data[:curr_count].copy_(coefficient_values.to(device=coeff_param.device, dtype=coeff_param.dtype))
             index_buffer[:curr_count].copy_(coefficient_indices.to(device=index_buffer.device, dtype=index_buffer.dtype))
 
-        if _elite_bitset_enabled():
-            elite_bitset = self.elite_bitset[adapter_name]
-            elite_bitset.zero_()
-            if curr_count > 0:
-                elite_bitset[index_buffer[:curr_count].long()] = True
-
         self.runtime[adapter_name].curr_count = curr_count
+        self._set_permutation_round(adapter_name, 0)
         if adapter_name in self.search_quantile_estimator:
             self.search_quantile_estimator[adapter_name].reset()
         self.clear_candidate_state(adapter_name)
@@ -240,15 +361,7 @@ class DSSLayer(BaseTunerLayer):
         return sampled
 
     def _sync_selected_locations(self, selected: torch.Tensor, device: torch.device) -> torch.Tensor:
-        """Keep DDP search state identical by promoting rank-0 selections everywhere.
-
-        Candidate batches are already broadcast from rank 0, but the scores are
-        computed from each rank's local batch. If each rank promotes its own
-        selected positions, `curr_count` and `elite_bitset` can drift apart and
-        later collective broadcasts can be called for different modules. Reusing
-        the same compact broadcast helper here keeps all sparse-search state in
-        lockstep while leaving the threshold/scoring logic unchanged.
-        """
+        """Keep DDP promotion choices identical by promoting rank-0 selections everywhere."""
 
         return self._broadcast_indices(selected.to(device=device, dtype=torch.long), device)
 
@@ -268,40 +381,33 @@ class DSSLayer(BaseTunerLayer):
     def refresh_candidate_batch(self, adapter_name: str) -> None:
         device = self._adapter_device(adapter_name)
         dense_numel = self.out_features * self.in_features
-        elite_bitset = self.elite_bitset[adapter_name] if _elite_bitset_enabled() else None
         runtime = self.runtime[adapter_name]
-        available = dense_numel - runtime.curr_count if elite_bitset is not None else dense_numel
-        target_k = min(self.candidate_size[adapter_name], max(available, 0))
-        if target_k <= 0:
+        if runtime.perm_seed == 0:
+            self._set_permutation_round(adapter_name, runtime.perm_round)
+
+        remaining_stream = dense_numel - runtime.perm_cursor
+        if remaining_stream <= 0:
+            self._set_permutation_round(adapter_name, runtime.perm_round + 1)
+            remaining_stream = dense_numel
+
+        remaining_budget = int(self.coefficient[adapter_name].numel()) - runtime.curr_count
+        target_k = min(self.candidate_size[adapter_name], remaining_stream)
+        if target_k <= 0 or remaining_budget <= 0:
             self.clear_candidate_state(adapter_name)
             return
 
-        sampled = torch.empty(0, device=device, dtype=torch.long)
-        if _dist_rank() == 0:
-            sample_k = max(target_k * 4, target_k)
-            proposal_chunks = []
-            while True:
-                proposal = torch.randint(0, dense_numel, (sample_k,), device=device)
-                proposal = torch.unique(proposal)
-                if elite_bitset is not None:
-                    proposal = proposal[~elite_bitset[proposal]]
-                if proposal.numel() > 0:
-                    proposal_chunks.append(proposal)
-                buffered = sum(chunk.numel() for chunk in proposal_chunks)
-                if buffered >= target_k or buffered >= available or sample_k >= dense_numel:
-                    if proposal_chunks:
-                        sampled = torch.unique(torch.cat(proposal_chunks, dim=0))
-                    break
-                if buffered == 0 and sample_k >= dense_numel:
-                    break
-                sample_k = min(dense_numel, max(sample_k * 2, target_k))
-            sampled = sampled[:target_k]
-
-        sampled = self._broadcast_indices(sampled, device)
+        t = torch.arange(runtime.perm_cursor, runtime.perm_cursor + target_k, device=device, dtype=torch.long)
+        if self.out_features % 64 == 0 and self.in_features % 64 == 0:
+            sampled = self._make_blockwise_permutation_indices(t, adapter_name, runtime.perm_round, device)
+        else:
+            sampled = self._make_flat_permutation_indices(t, adapter_name, runtime.perm_round, device)
+        runtime.perm_cursor += target_k
 
         self.candidate_indices[adapter_name] = sampled
         self.grad_cache[adapter_name] = None
         self.grad_count[adapter_name] = 0
+        self.abs_grad_sum[adapter_name] = None
+        self.grad_sq_sum[adapter_name] = None
         self._cache_theta0_abs_for_candidates(adapter_name, sampled, device)
 
     def refresh_init_candidate_batch(self, adapter_name: str) -> None:
@@ -469,15 +575,23 @@ class DSSLayer(BaseTunerLayer):
             return 0
 
         runtime = self.runtime[adapter_name]
+        candidate_indices = self.candidate_indices[adapter_name][selected].long()
+        if runtime.curr_count > 0 and candidate_indices.numel() > 0:
+            active = self.coefficient_indices[adapter_name][: runtime.curr_count].long()
+            active_sorted = torch.sort(active).values
+            pos = torch.searchsorted(active_sorted, candidate_indices)
+            pos_clamped = pos.clamp(max=active_sorted.numel() - 1)
+            duplicate = (pos < active_sorted.numel()) & (active_sorted[pos_clamped] == candidate_indices)
+            candidate_indices = candidate_indices[~duplicate]
+        if candidate_indices.numel() == 0:
+            return 0
+
         start = runtime.curr_count
-        end = start + int(selected.numel())
-        new_indices = self.candidate_indices[adapter_name][selected]
-        self.coefficient_indices[adapter_name][start:end] = new_indices
+        end = start + int(candidate_indices.numel())
+        self.coefficient_indices[adapter_name][start:end] = candidate_indices
         self.coefficient[adapter_name].data[start:end].zero_()
-        if _elite_bitset_enabled():
-            self.elite_bitset[adapter_name][new_indices] = True
         runtime.curr_count = end
-        return int(selected.numel())
+        return int(candidate_indices.numel())
 
     def maybe_refresh_stage1(self, adapter_name: str) -> int:
         runtime = self.runtime[adapter_name]
@@ -692,20 +806,25 @@ class DSSLinear(nn.Module, DSSLayer):
         self.coefficient[adapter_name] = nn.Parameter(torch.zeros(n_frequency, device=device, dtype=torch.float32))
         self.coefficient_indices[adapter_name] = torch.zeros(n_frequency, device=device, dtype=torch.long)
         self.candidate_indices[adapter_name] = torch.empty(0, device=device, dtype=torch.long)
-        elite_bitset_size = self.out_features * self.in_features if _elite_bitset_enabled() else 0
-        self.elite_bitset[adapter_name] = torch.zeros(elite_bitset_size, device=device, dtype=torch.bool)
         self.dropout_layer[adapter_name] = nn.Dropout(p=dropout) if dropout > 0.0 else nn.Identity()
-
-        self.runtime[adapter_name] = SearchRuntime()
+        self.score_method[adapter_name] = score_method
+        self.score_eps[adapter_name] = score_eps
+        self.module_name[adapter_name] = module_name or ""
+        self.runtime[adapter_name] = SearchRuntime(
+            perm_seed=self._stable_u64_seed(
+                self.module_name[adapter_name],
+                adapter_name,
+                self.out_features,
+                self.in_features,
+                0,
+            )
+        )
         self.grad_store_steps[adapter_name] = grad_store_steps
         self.candidate_size[adapter_name] = candidate_size
         self.low[adapter_name] = resolved_low
         self.up[adapter_name] = resolved_up
         self.threshold_mode[adapter_name] = threshold_mode
         self.threshold_log_every_steps[adapter_name] = int(threshold_log_every_steps)
-        self.score_method[adapter_name] = score_method
-        self.score_eps[adapter_name] = score_eps
-        self.module_name[adapter_name] = module_name or ""
         self.init_enabled[adapter_name] = init_enabled
         self.init_steps[adapter_name] = init_steps
         self.init_candidate_ratio[adapter_name] = init_candidate_ratio
@@ -723,7 +842,6 @@ class DSSLinear(nn.Module, DSSLayer):
         self._move_adapter_to_device_of_base_layer(adapter_name)
         self.coefficient_indices[adapter_name] = self.coefficient_indices[adapter_name].to(device=device, dtype=torch.long)
         self.candidate_indices[adapter_name] = self.candidate_indices[adapter_name].to(device=device, dtype=torch.long)
-        self.elite_bitset[adapter_name] = self.elite_bitset[adapter_name].to(device=device, dtype=torch.bool)
         self.set_adapter(self.active_adapters)
 
     def train(self, mode: bool = True):
