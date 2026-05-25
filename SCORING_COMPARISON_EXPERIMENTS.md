@@ -132,6 +132,73 @@
 | `snr` | `10` | completed | `commonsense_Llama3-8B_dss_nobasis_snr_nf180000_cand30000_gs10_ddp_scoringfull_20260522_204322` | `/root/code/DSS/logs_commonsense/20260522_204322_train_eval_snr.log`; eval: `/root/code/DSS/logs_commonsense/eval_commonsense_commonsense_Llama3-8B_dss_nobasis_snr_nf180000_cand30000_gs10_ddp_scoringfull_20260522_204322_20260522_204322.log` | `/root/code/DSS/output/commonsense_Llama3-8B_dss_nobasis_snr_nf180000_cand30000_gs10_ddp_scoringfull_20260522_204322` | `10000` | `0.7609` | `0.8977` | `0.8224` | `0.9478` | `0.8800` | `0.8251` | `0.9339` | `0.8800` | `0.8685` |
 | `newton_like` | `3` | completed | `commonsense_Llama3-8B_dss_nobasis_newton_like_nf180000_cand30000_gs3_ddp_scoringfull_20260523_094219` | `/root/code/DSS/logs_commonsense/20260523_094219_train_eval_newton_like.log`; eval: `/root/code/DSS/logs_commonsense/eval_commonsense_commonsense_Llama3-8B_dss_nobasis_newton_like_nf180000_cand30000_gs3_ddp_scoringfull_20260523_094219_20260523_094219.log` | `/root/code/DSS/output/commonsense_Llama3-8B_dss_nobasis_newton_like_nf180000_cand30000_gs3_ddp_scoringfull_20260523_094219` | `10000` | `0.7609` | `0.9010` | `0.8193` | `0.9477` | `0.8642` | `0.8294` | `0.9369` | `0.8820` | `0.8677` |
 
+## 最新方法
+
+当前最新一条方法不是上面那条历史 `snr` 基线，而是新的运行版实现：
+
+- `score_method = snr`
+- `candidate sampling = block-wise deterministic permutation + Feistel`
+- `forward = single-GEMM merged-weight path`
+- 训练配置：双卡 DDP，`n_frequency=180000`，`candidate_size=10000`，`grad_store_steps=10`
+- 阈值相关超参数：`ratio=0.05`，`low=100`，`up=1000`
+
+对应 run：
+
+- `run_name = commonsense_Llama3-8B_dss_nobasis_default_snr_nf180000_cand10000_gs10_20260524_092754`
+- `train_log = /root/code/DSS/logs_commonsense/20260524_092745_train_eval_default_snr_blockwise_singlegemm.log`
+- `eval_log = /root/code/DSS/logs_commonsense/eval_commonsense_commonsense_Llama3-8B_dss_nobasis_default_snr_nf180000_cand10000_gs10_20260524_092754_20260524_092754.log`
+
+8 个任务结果：
+
+- `boolq = 0.7609`
+- `piqa = 0.9015`
+- `social_i_qa = 0.8245`
+- `hellaswag = 0.9550`
+- `winogrande = 0.8682`
+- `ARC-Challenge = 0.8302`
+- `ARC-Easy = 0.9394`
+- `openbookqa = 0.8960`
+- `avg = 0.8720`
+
+备注：
+
+- 这条结果应视为“当前最新方法”结果。
+- 它和前面的 7-method scoring 表不是同一组完全等配置对比，因为这里同时引入了 `block-wise` 候选筛选策略与 single-GEMM forward 优化。
+- 除了实现策略变化外，这条 run 的阈值相关配置也与历史 scoring 基线不同：历史表里的常见设置是 `candidate_size=30000, ratio=0.1, low=500, up=4000`，而这条“最新方法”使用的是 `candidate_size=10000, ratio=0.05, low=100, up=1000`。
+
+### Llama2-7B 复现
+
+在保持这条“最新方法”绝大部分配置不变的前提下，我们又在 `Llama2-7B` 上做了一次复现：
+
+- `score_method = snr`
+- `candidate sampling = block-wise deterministic permutation + Feistel`
+- `forward = single-GEMM merged-weight path`
+- `n_frequency=180000`
+- `candidate_size=10000`
+- `grad_store_steps=10`
+- `ratio=0.05`
+- `low=100`
+- `up=1000`
+- 唯一显式改动：`lr=1.5e-4`
+
+对应 run：
+
+- `run_name = commonsense_Llama2-7B_dss_nobasis_default_snr_llama2_nf180000_cand10000_gs10_20260524_154851`
+- `train_log = /root/code/DSS/logs_commonsense/20260524_154840_train_eval_llama2_default_snr_blockwise_singlegemm.log`
+- `eval_log = /root/code/DSS/logs_commonsense/eval_commonsense_commonsense_Llama2-7B_dss_nobasis_default_snr_llama2_nf180000_cand10000_gs10_20260524_154851_20260524_154851.log`
+
+8 个任务结果：
+
+- `boolq = 0.7278`
+- `piqa = 0.8509`
+- `social_i_qa = 0.8122`
+- `hellaswag = 0.8875`
+- `winogrande = 0.8437`
+- `ARC-Challenge = 0.7432`
+- `ARC-Easy = 0.8784`
+- `openbookqa = 0.8280`
+- `avg = 0.8215`
+
 ## 备注模板
 
 后续每个方法实验完成后，建议至少补这几类备注：
@@ -147,4 +214,3 @@
   - `NaN`
   - score 极端 shrink
   - `snr` 或 `newton_like` 对 `eps` 过敏
-
