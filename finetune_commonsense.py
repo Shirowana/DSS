@@ -175,6 +175,23 @@ def resolve_train_dataset(dataset_obj) -> Dataset:
     raise ValueError(f"Unsupported dataset object loaded from disk: {type(dataset_obj)!r}")
 
 
+def resolve_train_eval_datasets(dataset_obj, val_set_size: int, seed: int) -> tuple[Dataset, Dataset | None]:
+    if isinstance(dataset_obj, DatasetDict) and "train" in dataset_obj and "validation" in dataset_obj:
+        return dataset_obj["train"], dataset_obj["validation"]
+    if hasattr(dataset_obj, "keys") and "train" in dataset_obj and "validation" in dataset_obj:
+        return dataset_obj["train"], dataset_obj["validation"]
+
+    full_train_dataset = resolve_train_dataset(dataset_obj)
+    if val_set_size > 0:
+        if val_set_size >= len(full_train_dataset):
+            raise ValueError(
+                f"`--val_set_size` ({val_set_size}) must be smaller than the dataset size ({len(full_train_dataset)})."
+            )
+        split = full_train_dataset.train_test_split(test_size=val_set_size, shuffle=True, seed=seed)
+        return split["train"], split["test"]
+    return full_train_dataset, None
+
+
 def build_balanced_init_dataset(train_dataset: Dataset, batch_size: int, init_steps: int, seed: int) -> Dataset:
     if "task_name" not in train_dataset.column_names:
         raise ValueError(
@@ -520,19 +537,11 @@ def main() -> None:
         dataset_path = Path(args.dataset_path)
     else:
         dataset_path = Path(args.data_dir) / f"train_all_{args.max_length}_OnlyOutput_{args.model_name}"
-    full_train_dataset = resolve_train_dataset(load_from_disk(str(dataset_path)))
-
-    if args.val_set_size > 0:
-        if args.val_set_size >= len(full_train_dataset):
-            raise ValueError(
-                f"`--val_set_size` ({args.val_set_size}) must be smaller than the dataset size ({len(full_train_dataset)})."
-            )
-        split = full_train_dataset.train_test_split(test_size=args.val_set_size, shuffle=True, seed=args.seed)
-        train_dataset = split["train"]
-        eval_dataset = split["test"]
-    else:
-        train_dataset = full_train_dataset
-        eval_dataset = None
+    train_dataset, eval_dataset = resolve_train_eval_datasets(
+        load_from_disk(str(dataset_path)),
+        val_set_size=args.val_set_size,
+        seed=args.seed,
+    )
 
     def collate_fn(batch):
         input_ids = [torch.as_tensor(item["input_ids"], dtype=torch.long) for item in batch]
