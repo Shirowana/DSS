@@ -229,6 +229,21 @@ if [[ "${EXPERIMENT_RECORD_ENABLED}" == "1" ]]; then
     python scripts/export_math_runs_csv.py
 fi
 
+{
+    echo
+    echo "========== MATH EVAL LAUNCH =========="
+    echo "[eval] start: $(date)"
+    echo "eval_output_dir=${EVAL_OUTPUT_DIR}"
+    if [[ "${EVAL_PARALLEL_2GPU}" == "1" ]]; then
+        echo "eval_mode=2gpu"
+        echo "gpu0_log=${LOG_ROOT}/${RUN_NAME}_gpu0_gsm8k.log"
+        echo "gpu1_log=${LOG_ROOT}/${RUN_NAME}_gpu1_svamp_aqua_mawps.log"
+    else
+        echo "eval_mode=single"
+        echo "eval_log=${LOG_ROOT}/${RUN_NAME}.log"
+    fi
+} | tee -a "${LOG_FILE}"
+
 MODEL_NAME="${MODEL_NAME}" \
 MODEL_PATH="${MODEL_PATH}" \
 DATA_DIR="${EVAL_DATA_DIR}" \
@@ -238,8 +253,6 @@ MAX_NEW_TOKENS="${EVAL_MAX_NEW_TOKENS}" \
 NUM_BEAMS="${EVAL_NUM_BEAMS}" \
 MAX_EXAMPLES="${EVAL_MAX_EXAMPLES}" \
 RUN_NAME="${RUN_NAME}" \
-LOG_FILE="${LOG_FILE}" \
-LOG_APPEND=1 \
 EVAL_PARALLEL_2GPU="${EVAL_PARALLEL_2GPU}" \
 EXPERIMENT_RECORD_ENABLED="${EXPERIMENT_RECORD_ENABLED}" \
 bash "${REMOTE_PROJECT_ROOT}/scripts/eval_math_reasoning.sh" "${OUTPUT_DIR}" all "${EVAL_OUTPUT_DIR}"
@@ -248,7 +261,7 @@ bash "${REMOTE_PROJECT_ROOT}/scripts/eval_math_reasoning.sh" "${OUTPUT_DIR}" all
     echo
     echo "========== MATH TRAIN+EVAL DONE =========="
     echo "[done] finish: $(date)"
-    echo "log_file=${LOG_FILE}"
+    echo "train_log=${LOG_FILE}"
     echo "output_dir=${OUTPUT_DIR}"
     echo "eval_output_dir=${EVAL_OUTPUT_DIR}"
 } | tee -a "${LOG_FILE}"

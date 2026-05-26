@@ -61,12 +61,13 @@ else
 fi
 
 if [[ "${DATASET_ARG}" == "all" && "${EVAL_PARALLEL_2GPU}" == "1" ]]; then
+    worker0_log="${LOG_ROOT}/${RUN_NAME}_gpu${GPU0_DEVICE}_${GPU0_DATASETS// /_}.log"
+    worker1_log="${LOG_ROOT}/${RUN_NAME}_gpu${GPU1_DEVICE}_${GPU1_DATASETS// /_}.log"
     {
         echo "========== MATH REASONING EVAL =========="
         echo "[eval] start: $(date)"
         echo "ADAPTER_PATH=${ADAPTER_PATH}"
         echo "OUTPUT_DIR=${OUTPUT_DIR}"
-        echo "LOG_FILE=${LOG_FILE}"
         echo "MODEL_NAME=${MODEL_NAME}"
         echo "MODEL_PATH=${MODEL_PATH}"
         echo "DATA_DIR=${DATA_DIR}"
@@ -74,20 +75,20 @@ if [[ "${DATASET_ARG}" == "all" && "${EVAL_PARALLEL_2GPU}" == "1" ]]; then
         echo "EVAL_PARALLEL_2GPU=1"
         echo "GPU0_DEVICE=${GPU0_DEVICE}"
         echo "GPU0_DATASETS=${GPU0_DATASETS}"
+        echo "GPU0_LOG_FILE=${worker0_log}"
         echo "GPU1_DEVICE=${GPU1_DEVICE}"
         echo "GPU1_DATASETS=${GPU1_DATASETS}"
+        echo "GPU1_LOG_FILE=${worker1_log}"
         echo "BATCH_SIZE=${BATCH_SIZE}"
         echo "MAX_NEW_TOKENS=${MAX_NEW_TOKENS}"
         echo "NUM_BEAMS=${NUM_BEAMS}"
         echo "MAX_EXAMPLES=${MAX_EXAMPLES}"
         echo "PRECISION=${PRECISION}"
         echo
-    } | tee "${log_tee_args[@]}" "${LOG_FILE}"
+    }
 
     worker0_dir="${OUTPUT_DIR}/worker_gpu${GPU0_DEVICE}"
     worker1_dir="${OUTPUT_DIR}/worker_gpu${GPU1_DEVICE}"
-    worker0_log="${OUTPUT_DIR}/worker_gpu${GPU0_DEVICE}.log"
-    worker1_log="${OUTPUT_DIR}/worker_gpu${GPU1_DEVICE}.log"
 
     run_worker() {
         local device=$1
@@ -120,11 +121,11 @@ if [[ "${DATASET_ARG}" == "all" && "${EVAL_PARALLEL_2GPU}" == "1" ]]; then
 
     status=0
     if ! wait "${pid0}"; then
-        echo "[eval] GPU${GPU0_DEVICE} worker failed. See ${worker0_log}" | tee -a "${LOG_FILE}"
+        echo "[eval] GPU${GPU0_DEVICE} worker failed. See ${worker0_log}"
         status=1
     fi
     if ! wait "${pid1}"; then
-        echo "[eval] GPU${GPU1_DEVICE} worker failed. See ${worker1_log}" | tee -a "${LOG_FILE}"
+        echo "[eval] GPU${GPU1_DEVICE} worker failed. See ${worker1_log}"
         status=1
     fi
     if [[ "${status}" != "0" ]]; then
@@ -158,13 +159,11 @@ for worker_dir in worker_dirs:
 )
 PY
 
-    {
-        echo "[eval] workers done: $(date)"
-        echo "[eval] worker logs:"
-        echo "  ${worker0_log}"
-        echo "  ${worker1_log}"
-        echo "[eval] merged summary: ${OUTPUT_DIR}/summary.json"
-    } | tee -a "${LOG_FILE}"
+    echo "[eval] workers done: $(date)"
+    echo "[eval] worker logs:"
+    echo "  ${worker0_log}"
+    echo "  ${worker1_log}"
+    echo "[eval] merged summary: ${OUTPUT_DIR}/summary.json"
 
     if [[ "${EXPERIMENT_RECORD_ENABLED}" == "1" ]]; then
         FULL_EVAL_FLAG=1
@@ -182,7 +181,7 @@ PY
         python scripts/export_math_runs_csv.py
     fi
 
-    echo "[eval] done: $(date)" | tee -a "${LOG_FILE}"
+    echo "[eval] done: $(date)"
     exit 0
 fi
 

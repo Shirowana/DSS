@@ -153,6 +153,12 @@ EVAL_PARALLEL_2GPU=0 bash train_eval_math.sh
 bash scripts/eval_math_reasoning.sh <adapter_dir> gsm8k <output_dir>
 ```
 
+日志口径：
+
+- 训练 + 评测：训练阶段只写一个 train log；评测阶段不混入 train log，只在 train log 里记录两个 eval log 路径
+- 双卡评测：`GPU0` 和 `GPU1` 各写一个独立 eval log，不共同写同一个文件
+- 仅评测：同样生成两个独立 eval log，分别对应 `gsm8k` 和 `svamp+aqua+mawps`
+
 `num_beams=4` 的优点是搜索更充分，模型会同时保留 4 条候选路径，可能减少贪心解码早期选错 token 的问题，因此 MISA/DIABLO/SMT 相关代码里常见 `num_beams=4`。但代价也明显：理论上每步大约要维护 4 条 beam，时间和显存开销接近放大到 `3-4x`，实际会受 batch、KV cache 和实现影响。
 
 当前我们优先采用：
