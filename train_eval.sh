@@ -339,9 +339,6 @@ fi
     echo "eval_output_dir=${EVAL_OUTPUT_DIR}"
 } | tee -a "${LOG_FILE}"
 
-EVAL_RUN_NAME="eval_commonsense_${RUN_NAME}_${TIMESTAMP}"
-EVAL_LOG_FILE="${LOG_ROOT}/${EVAL_RUN_NAME}.log"
-
 MODEL_NAME="${MODEL_NAME}" \
 MODEL_PATH="${MODEL_PATH}" \
 DATA_DIR="${EVAL_DATA_DIR}" \
@@ -353,17 +350,17 @@ MAX_EXAMPLES="${EVAL_MAX_EXAMPLES}" \
 DEBUG_EVAL="${EVAL_DEBUG_EVAL}" \
 DEBUG_FIRST_N="${EVAL_DEBUG_FIRST_N}" \
 DEBUG_MAX_FAILURES="${EVAL_DEBUG_MAX_FAILURES}" \
-RUN_NAME="${EVAL_RUN_NAME}" \
-LOG_FILE="${EVAL_LOG_FILE}" \
+RUN_NAME="${RUN_NAME}" \
+LOG_FILE="${LOG_FILE}" \
+LOG_APPEND=1 \
 EXPERIMENT_RECORD_ENABLED="${EXPERIMENT_RECORD_ENABLED}" \
-bash "${REMOTE_PROJECT_ROOT}/scripts/eval_commonsense.sh" "${OUTPUT_DIR}" all "${EVAL_OUTPUT_DIR}" 2>&1 | tee -a "${LOG_FILE}"
+bash "${REMOTE_PROJECT_ROOT}/scripts/eval_commonsense.sh" "${OUTPUT_DIR}" all "${EVAL_OUTPUT_DIR}"
 
 {
     echo
     echo "========== TRAIN+EVAL DONE =========="
     echo "[done] finish: $(date)"
-    echo "train_log=${LOG_FILE}"
-    echo "eval_log=${EVAL_LOG_FILE}"
+    echo "log_file=${LOG_FILE}"
     echo "output_dir=${OUTPUT_DIR}"
     echo "eval_output_dir=${EVAL_OUTPUT_DIR}"
 } | tee -a "${LOG_FILE}"

@@ -1,6 +1,4 @@
 #!/bin/bash
-# Train DSS on Math10K and evaluate GSM8K, SVAMP, AQuA, and MAWPS.
-
 set -euo pipefail
 
 REMOTE_PROJECT_ROOT=${REMOTE_PROJECT_ROOT:-"/root/code/DSS"}
@@ -26,11 +24,11 @@ fi
 MAX_LENGTH=${MAX_LENGTH:-512}
 MAX_PROMPT_LENGTH=${MAX_PROMPT_LENGTH:-256}
 DATA_DIR=${DATA_DIR:-"${REMOTE_DATA_ROOT}/math_reasoning/processed"}
-EVAL_DATA_DIR=${EVAL_DATA_DIR:-"${REMOTE_DATA_ROOT}/math_reasoning/raw_eval"}
+EVAL_DATA_DIR=${EVAL_DATA_DIR:-"${REMOTE_DATA_ROOT}/evaluate"}
 DATASET_PATH=${DATASET_PATH:-"${DATA_DIR}/math10k_${MAX_LENGTH}_prompt${MAX_PROMPT_LENGTH}_OnlyOutput_${MODEL_NAME}"}
 VAL_SET_SIZE=${VAL_SET_SIZE:-500}
 
-TARGET_MODULES=${TARGET_MODULES:-"qvud"}
+TARGET_MODULES=${TARGET_MODULES:-"qkvud"}
 N_FREQUENCY=${N_FREQUENCY:-180000}
 CANDIDATE_SIZE=${CANDIDATE_SIZE:-30000}
 GRAD_STORE_STEPS=${GRAD_STORE_STEPS:-3}
@@ -38,15 +36,15 @@ LOW=${LOW:-500}
 UP=${UP:-4000}
 RATIO=${RATIO:-0.1}
 THRESHOLD_MODE=${THRESHOLD_MODE:-"oracle"}
-SCORE_METHOD=${SCORE_METHOD:-"abs_mean"}
+SCORE_METHOD=${SCORE_METHOD:-"snr"}
 SCORE_EPS=${SCORE_EPS:-"1e-8"}
 DSS_DROPOUT=${DSS_DROPOUT:-0.05}
 QUANTILE_LR=${QUANTILE_LR:-0.01}
 QUANTILE_ALPHA=${QUANTILE_ALPHA:-0.0}
 THRESHOLD_LOG_EVERY_STEPS=${THRESHOLD_LOG_EVERY_STEPS:-100}
 
-BATCH_SIZE=${BATCH_SIZE:-4}
-GRAD_ACCUM_STEPS=${GRAD_ACCUM_STEPS:-1}
+BATCH_SIZE=${BATCH_SIZE:-8}
+GRAD_ACCUM_STEPS=${GRAD_ACCUM_STEPS:-2}
 NUM_EPOCHS=${NUM_EPOCHS:-3}
 MAX_STEPS=${MAX_STEPS:--1}
 PRECISION=${PRECISION:-"bf16"}
@@ -61,13 +59,14 @@ NUM_WORKERS=${NUM_WORKERS:-0}
 REPORT_TO=${REPORT_TO:-"none"}
 SEED=${SEED:-42}
 RESUME_FROM_CHECKPOINT=${RESUME_FROM_CHECKPOINT:-}
-NUM_GPUS=${NUM_GPUS:-1}
+NUM_GPUS=${NUM_GPUS:-2}
 MASTER_PORT=${MASTER_PORT:-29500}
 
-EVAL_BATCH_SIZE=${EVAL_BATCH_SIZE:-1}
+EVAL_BATCH_SIZE=${EVAL_BATCH_SIZE:-4}
 EVAL_MAX_NEW_TOKENS=${EVAL_MAX_NEW_TOKENS:-512}
 EVAL_NUM_BEAMS=${EVAL_NUM_BEAMS:-1}
 EVAL_MAX_EXAMPLES=${EVAL_MAX_EXAMPLES:-0}
+EVAL_PARALLEL_2GPU=${EVAL_PARALLEL_2GPU:-1}
 EXPERIMENT_RECORD_ENABLED=${EXPERIMENT_RECORD_ENABLED:-1}
 
 RUN_MODE=${RUN_MODE:-"${THRESHOLD_MODE}"}
@@ -94,7 +93,8 @@ source ~/miniconda3/etc/profile.d/conda.sh
 conda activate quest
 
 if [[ -z "${CUDA_VISIBLE_DEVICES:-}" ]]; then
-    export CUDA_VISIBLE_DEVICES=0
+    CUDA_VISIBLE_DEVICES=$(seq -s, 0 $((NUM_GPUS - 1)))
+    export CUDA_VISIBLE_DEVICES
 fi
 export PYTHONPATH="${REMOTE_PEFT_SRC}:${REMOTE_PROJECT_ROOT}:${PYTHONPATH:-}"
 export WANDB_PROJECT=${WANDB_PROJECT:-"dss_math"}
@@ -106,9 +106,9 @@ for path in "${MODEL_PATH}" "${DATASET_PATH}"; do
         exit 1
     fi
 done
-for dataset in gsm8k svamp aqua mawps; do
-    if [[ ! -f "${EVAL_DATA_DIR}/${dataset}/test.json" ]]; then
-        echo "Missing eval dataset file: ${EVAL_DATA_DIR}/${dataset}/test.json" >&2
+for dataset_path in gsm8k/test.json SVAMP/test.json AQuA/test.json mawps/test.json; do
+    if [[ ! -f "${EVAL_DATA_DIR}/${dataset_path}" ]]; then
+        echo "Missing eval dataset file: ${EVAL_DATA_DIR}/${dataset_path}" >&2
         exit 1
     fi
 done
@@ -229,8 +229,6 @@ if [[ "${EXPERIMENT_RECORD_ENABLED}" == "1" ]]; then
     python scripts/export_math_runs_csv.py
 fi
 
-EVAL_RUN_NAME="eval_math_${RUN_NAME}_${TIMESTAMP}"
-EVAL_LOG_FILE="${LOG_ROOT}/${EVAL_RUN_NAME}.log"
 MODEL_NAME="${MODEL_NAME}" \
 MODEL_PATH="${MODEL_PATH}" \
 DATA_DIR="${EVAL_DATA_DIR}" \
@@ -239,17 +237,18 @@ BATCH_SIZE="${EVAL_BATCH_SIZE}" \
 MAX_NEW_TOKENS="${EVAL_MAX_NEW_TOKENS}" \
 NUM_BEAMS="${EVAL_NUM_BEAMS}" \
 MAX_EXAMPLES="${EVAL_MAX_EXAMPLES}" \
-RUN_NAME="${EVAL_RUN_NAME}" \
-LOG_FILE="${EVAL_LOG_FILE}" \
+RUN_NAME="${RUN_NAME}" \
+LOG_FILE="${LOG_FILE}" \
+LOG_APPEND=1 \
+EVAL_PARALLEL_2GPU="${EVAL_PARALLEL_2GPU}" \
 EXPERIMENT_RECORD_ENABLED="${EXPERIMENT_RECORD_ENABLED}" \
-bash "${REMOTE_PROJECT_ROOT}/scripts/eval_math_reasoning.sh" "${OUTPUT_DIR}" all "${EVAL_OUTPUT_DIR}" 2>&1 | tee -a "${LOG_FILE}"
+bash "${REMOTE_PROJECT_ROOT}/scripts/eval_math_reasoning.sh" "${OUTPUT_DIR}" all "${EVAL_OUTPUT_DIR}"
 
 {
     echo
     echo "========== MATH TRAIN+EVAL DONE =========="
     echo "[done] finish: $(date)"
-    echo "train_log=${LOG_FILE}"
-    echo "eval_log=${EVAL_LOG_FILE}"
+    echo "log_file=${LOG_FILE}"
     echo "output_dir=${OUTPUT_DIR}"
     echo "eval_output_dir=${EVAL_OUTPUT_DIR}"
 } | tee -a "${LOG_FILE}"

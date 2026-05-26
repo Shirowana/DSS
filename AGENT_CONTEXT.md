@@ -4,6 +4,16 @@
 
 这个项目当前在做的是：基于 `Llama3-8B` 的 commonsense 多任务指令微调，研究一套自定义的稀疏 PEFT 方法 `DSS`，并重点比较不同 threshold 策略、不同 budget、以及不同候选筛选统计量对最终效果的影响。当前主线方法不是 LoRA，也不是带 basis 的旧 DSS，而是已经收敛成一版 **`no-basis, stage1-only DSS`**。
 
+近期新增主线：数学推理任务。新 Agent 如果接到 Math10K、GSM8K、SVAMP、AQuA、MAWPS、`train_eval_math.sh` 或 `evaluate_math_reasoning.py` 相关请求，应优先阅读 [math_task.md](/root/code/DSS/math_task.md)。该文档是当前执行版协议，旧的 [数学推理任务.md](/root/code/DSS/数学推理任务.md) 只作为历史讨论归档。
+
+数学任务当前入口：
+
+- 训练 + 双卡评测：[train_eval_math.sh](/root/code/DSS/train_eval_math.sh)
+- 训练-only：[run_dss_math.sh](/root/code/DSS/run_dss_math.sh)
+- 数学评测：[scripts/eval_math_reasoning.sh](/root/code/DSS/scripts/eval_math_reasoning.sh)，`dataset=all` 默认双卡，指定单任务时单卡调试
+- Python 评测：[evaluate_math_reasoning.py](/root/code/DSS/evaluate_math_reasoning.py)
+- Math10K 预处理：[data_processing/process_math10k.py](/root/code/DSS/data_processing/process_math10k.py)
+
 目前最重要的三个结论是：
 
 - 当前真正训练使用的 DSS 实现位于 `quest/peft/src/peft/tuners/dss/`，不是项目根目录下那份镜像副本。

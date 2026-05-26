@@ -20,6 +20,12 @@ REMOTE_MODEL_ROOT = Path("/root/hf_cache_models/models")
 
 DATASETS = ["gsm8k", "svamp", "aqua", "mawps"]
 RESPONSE_PREFIX = "Let's think step by step."
+DATASET_DIR_NAMES = {
+    "gsm8k": "gsm8k",
+    "svamp": "SVAMP",
+    "aqua": "AQuA",
+    "mawps": "mawps",
+}
 
 MODEL_MAP = {
     "Llama3-8B": str(REMOTE_MODEL_ROOT / "Meta-Llama-3-8B"),
@@ -34,7 +40,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--model_path", default=None)
     parser.add_argument("--adapter_path", default=None)
     parser.add_argument("--output_dir", required=True)
-    parser.add_argument("--data_dir", default=str(REMOTE_DATA_ROOT / "math_reasoning" / "raw_eval"))
+    parser.add_argument("--data_dir", default=str(REMOTE_DATA_ROOT / "evaluate"))
     parser.add_argument("--batch_size", type=int, default=1)
     parser.add_argument("--precision", default="bf16", choices=["fp32", "fp16", "bf16"])
     parser.add_argument("--model_cache_dir", default=str(REMOTE_MODEL_ROOT))
@@ -71,7 +77,12 @@ def generate_prompt(dataset: str, instruction: str, input_text: str = "") -> str
 
 
 def load_data(args: argparse.Namespace) -> list[dict]:
-    path = Path(args.data_dir) / args.dataset / "test.json"
+    data_dir = Path(args.data_dir)
+    path = data_dir / DATASET_DIR_NAMES[args.dataset] / "test.json"
+    if not path.exists():
+        path = data_dir / args.dataset / "test.json"
+    if not path.exists() and data_dir.name in {args.dataset, DATASET_DIR_NAMES[args.dataset]}:
+        path = data_dir / "test.json"
     if not path.exists():
         raise FileNotFoundError(f"Cannot find dataset file: {path}")
     with path.open("r", encoding="utf-8") as handle:
@@ -176,12 +187,12 @@ def extract_numeric_answer(output: str) -> str:
 def extract_choice_answer(output: str) -> str:
     patterns = [
         r"answer\s*:?\s*\(?([ABCDE])\)?",
-        r"the answer is\s*\(?([ABCDE])\)?",
+        r"the answer is\s*:?\s*\(?([ABCDE])\)?",
         r"\(([ABCDE])\)",
         r"\b([ABCDE])\b",
     ]
     for pattern in patterns:
-        matches = re.findall(pattern, output, flags=re.IGNORECASE)
+        matches = re.findall(pattern, output)
         if matches:
             return matches[-1].upper()
     return ""

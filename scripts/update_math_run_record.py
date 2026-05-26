@@ -8,6 +8,12 @@ from pathlib import Path
 
 
 DATASETS = ["gsm8k", "svamp", "aqua", "mawps"]
+DATASET_DIR_NAMES = {
+    "gsm8k": "gsm8k",
+    "svamp": "SVAMP",
+    "aqua": "AQuA",
+    "mawps": "mawps",
+}
 
 
 def parse_args() -> argparse.Namespace:
@@ -18,7 +24,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--eval_output_dir", default=None)
     parser.add_argument("--dataset", default=None, choices=DATASETS)
     parser.add_argument("--is_full_eval", type=int, default=None, choices=[0, 1])
-    parser.add_argument("--data_dir", default="/root/datasets/math_reasoning/raw_eval")
+    parser.add_argument("--data_dir", default="/root/datasets/evaluate")
     parser.add_argument("--project_root", default="/root/code/DSS")
     parser.add_argument("--notes", default=None)
     return parser.parse_args()
@@ -94,7 +100,9 @@ def parse_trainer_state(output_dir: Path) -> dict:
 
 
 def expected_total(data_dir: Path, dataset: str) -> int | None:
-    path = data_dir / dataset / "test.json"
+    path = data_dir / DATASET_DIR_NAMES[dataset] / "test.json"
+    if not path.exists():
+        path = data_dir / dataset / "test.json"
     if not path.exists():
         return None
     with path.open("r", encoding="utf-8") as handle:

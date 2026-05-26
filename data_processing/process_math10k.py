@@ -75,12 +75,8 @@ def instruction_prompt(instruction: str, input_text: str = "") -> str:
     )
 
 
-def response_parts(row: dict) -> tuple[str, str]:
-    output = str(row.get("output") or "").strip()
-    answer = str(row.get("answer") or "").strip()
-    if not answer:
-        return output, ""
-    return output, f"The final answer is: {answer}"
+def normalize_response(row: dict) -> str:
+    return str(row.get("output") or "").strip()
 
 
 def main() -> None:
@@ -108,20 +104,15 @@ def main() -> None:
 
     truncation_stats = {
         "prompt_truncated": 0,
-        "reasoning_truncated": 0,
         "response_truncated": 0,
-        "final_answer_preserved": 0,
         "total": 0,
     }
 
     def tokenize_row(row: dict) -> dict:
         prompt = instruction_prompt(str(row.get("instruction") or ""), str(row.get("input") or ""))
-        reasoning, final_answer = response_parts(row)
+        response = normalize_response(row)
         prompt_ids = tokenizer(prompt, add_special_tokens=False)["input_ids"]
-        reasoning_ids = tokenizer(reasoning, add_special_tokens=False)["input_ids"]
-        final_answer_ids = []
-        if final_answer:
-            final_answer_ids = tokenizer(f"\n\n{final_answer}", add_special_tokens=False)["input_ids"]
+        response_ids = tokenizer(response, add_special_tokens=False)["input_ids"]
 
         if len(prompt_ids) > args.max_prompt_length:
             prompt_ids = prompt_ids[-args.max_prompt_length :]
@@ -133,20 +124,6 @@ def main() -> None:
             available_response = 1
             truncation_stats["prompt_truncated"] += 1
 
-        if final_answer_ids and len(final_answer_ids) >= available_response:
-            final_answer_ids = final_answer_ids[:available_response]
-            reasoning_ids = []
-            truncation_stats["response_truncated"] += 1
-        else:
-            available_reasoning = available_response - len(final_answer_ids)
-            if len(reasoning_ids) > available_reasoning:
-                reasoning_ids = reasoning_ids[:available_reasoning]
-                truncation_stats["reasoning_truncated"] += 1
-                truncation_stats["response_truncated"] += 1
-
-        response_ids = reasoning_ids + final_answer_ids
-        if final_answer_ids:
-            truncation_stats["final_answer_preserved"] += 1
         if len(response_ids) > available_response:
             response_ids = response_ids[:available_response]
             truncation_stats["response_truncated"] += 1
@@ -188,7 +165,7 @@ def main() -> None:
         "truncation": truncation_stats,
         "notes": (
             "Prompt tokens are label-masked; prompts use `### Response: Let's think step by step.`; "
-            "reasoning is truncated before the standardized final-answer suffix."
+            "responses use the original Math10K output without appending an extra final-answer suffix."
         ),
     }
     metadata_dir = output_root.parent / "metadata"

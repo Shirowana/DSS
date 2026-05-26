@@ -1,9 +1,3 @@
-"""Fine-tune DSS on the Math10K protocol.
-
-The training loop is intentionally shared with finetune_commonsense.py; this
-wrapper only swaps project defaults and supported model names for math runs.
-"""
-
 from __future__ import annotations
 
 from pathlib import Path

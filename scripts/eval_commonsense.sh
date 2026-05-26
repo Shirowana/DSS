@@ -35,6 +35,7 @@ ADAPTER_NAME="$(basename "${ADAPTER_PATH}")"
 RUN_NAME=${RUN_NAME:-"eval_commonsense_${MODEL_NAME:-Llama3-8B}_${ADAPTER_NAME}_${TIMESTAMP}"}
 OUTPUT_DIR=${3:-"${RESULT_ROOT}/${RUN_NAME}"}
 LOG_FILE=${LOG_FILE:-"${LOG_ROOT}/${RUN_NAME}.log"}
+LOG_APPEND=${LOG_APPEND:-0}
 EXPERIMENT_RECORD_ENABLED=${EXPERIMENT_RECORD_ENABLED:-1}
 EXPERIMENT_MD=${EXPERIMENT_MD:-"${EXPERIMENT_ROOT}/${ADAPTER_NAME}.md"}
 
@@ -72,6 +73,12 @@ fi
 
 mkdir -p "${OUTPUT_DIR}" "${LOG_ROOT}" "${RESULT_ROOT}" "${EXPERIMENT_ROOT}"
 
+if [[ "${LOG_APPEND}" == "1" ]]; then
+    log_tee_args=(-a)
+else
+    log_tee_args=()
+fi
+
 {
     echo "========== COMMONSENSE EVAL =========="
     echo "[eval] start: $(date)"
@@ -94,7 +101,7 @@ mkdir -p "${OUTPUT_DIR}" "${LOG_ROOT}" "${RESULT_ROOT}" "${EXPERIMENT_ROOT}"
     echo "EXPERIMENT_ROOT=${EXPERIMENT_ROOT}"
     echo "EXPERIMENT_MD=${EXPERIMENT_MD}"
     echo
-} | tee "${LOG_FILE}"
+} | tee "${log_tee_args[@]}" "${LOG_FILE}"
 
 for dataset in ${DATASETS}; do
     echo "========== DATASET: ${dataset} ==========" | tee -a "${LOG_FILE}"
