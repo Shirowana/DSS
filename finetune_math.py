@@ -10,9 +10,14 @@ REMOTE_MODEL_ROOT = Path("/root/hf_cache_models/models")
 
 
 def build_run_name(args, timestamp: str) -> str:
+    if args.peft_method == "dss":
+        return (
+            f"math_{args.model_name}_dss_nobasis_"
+            f"nf{args.n_frequency}_cand{args.candidate_size}_gs{args.grad_store_steps}_{timestamp}"
+        )
     return (
-        f"math_{args.model_name}_dss_nobasis_"
-        f"nf{args.n_frequency}_cand{args.candidate_size}_gs{args.grad_store_steps}_{timestamp}"
+        f"math_{args.model_name}_{args.peft_method}_"
+        f"r{args.lora_r}_a{args.lora_alpha}_lr{args.lr}_{timestamp}"
     )
 
 

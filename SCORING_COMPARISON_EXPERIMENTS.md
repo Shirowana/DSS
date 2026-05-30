@@ -106,7 +106,7 @@
 - `save_steps = 10000`
 - `load_best_model_at_end = 1`
 - `precision = bf16`
-- `warmup_steps = 100`
+- `warmup_ratio = 0.03`
 - `seed = 42`
 - `REPORT_TO = none`，后续默认不开 `wandb`
 
@@ -124,13 +124,13 @@
 
 | score_method | grad_store_steps | status | run_name | log_file | adapter_path | best_step | boolq | piqa | social_i_qa | hellaswag | winogrande | ARC-Challenge | ARC-Easy | openbookqa | avg |
 | --- | ---: | --- | --- | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| `mean_abs` | `3` | completed | `commonsense_Llama3-8B_dss_nobasis_mean_abs_nf180000_cand30000_gs3_ddp_scoringfull_20260520_031827` | `/root/code/DSS/logs_commonsense/20260520_031827_train_eval_mean_abs.log` | `/root/code/DSS/output/commonsense_Llama3-8B_dss_nobasis_mean_abs_nf180000_cand30000_gs3_ddp_scoringfull_20260520_031827` | `10000` | `0.7404` | `0.8988` | `0.8163` | `0.9447` | `0.8824` | `0.8217` | `0.9314` | `0.8560` | `0.8615` |
+| `mean_abs` | `3` | completed | `commonsense_Llama3-8B_dss_nobasis_mean_abs_nf180000_cand30000_gs3_ddp_scoringfull_20260520_031827` | `/root/code/DSS/logs_commonsense/20260520_031827_train_eval_mean_abs.log`; eval: `/root/code/DSS/logs_commonsense/eval_commonsense_mean_abs_ckpt15966_20260527_0822.log` | `/root/code/DSS/output/commonsense_Llama3-8B_dss_nobasis_mean_abs_nf180000_cand30000_gs3_ddp_scoringfull_20260520_031827/checkpoint-15966` | `15966` | `0.7434` | `0.8950` | `0.8168` | `0.9482` | `0.8824` | `0.8251` | `0.9318` | `0.8660` | `0.8636` |
 | `abs_mean` | `3` | completed | `commonsense_Llama3-8B_dss_nobasis_nf180000_cand30000_gs3_repro8619_ddp_20260513` | `/root/code/DSS/logs_commonsense/20260513_000001_train_eval_oracle.log` | `/root/code/DSS/output/commonsense_Llama3-8B_dss_nobasis_nf180000_cand30000_gs3_repro8619_ddp_20260513` | `10000` | `0.7367` | `0.8906` | `0.8199` | `0.9472` | `0.8887` | `0.8242` | `0.9318` | `0.8820` | `0.8651` |
 | `mean_square` | `3` | completed | `commonsense_Llama3-8B_dss_nobasis_mean_square_nf180000_cand30000_gs3_ddp_scoringfull_20260520_163158` | `/root/code/DSS/logs_commonsense/20260520_163158_train_eval_mean_square.log`; eval: `/root/code/DSS/logs_commonsense/eval_commonsense_mean_square_ckpt10000_20260521.log` | `/root/code/DSS/output/commonsense_Llama3-8B_dss_nobasis_mean_square_nf180000_cand30000_gs3_ddp_scoringfull_20260520_163158` | `10000` | `0.7419` | `0.8863` | `0.8229` | `0.9414` | `0.8848` | `0.8225` | `0.9293` | `0.8660` | `0.8619` |
 | `rms_over_param` | `3` | completed | `commonsense_Llama3-8B_dss_nobasis_rms_over_param_nf180000_cand30000_gs3_ddp_scoringfull_20260521_080807` | `/root/code/DSS/logs_commonsense/20260521_080807_train_eval_rms_over_param.log` | `/root/code/DSS/output/commonsense_Llama3-8B_dss_nobasis_rms_over_param_nf180000_cand30000_gs3_ddp_scoringfull_20260521_080807` | `10000` | `0.7483` | `0.8955` | `0.8229` | `0.9442` | `0.8745` | `0.8328` | `0.9251` | `0.8880` | `0.8664` |
-| `abs_mean_over_param` | `3` | completed | `commonsense_Llama3-8B_dss_nobasis_abs_mean_over_param_nf180000_cand30000_gs3_ddp_scoringfull_20260522_090700` | `/root/code/DSS/logs_commonsense/20260522_090700_train_eval_abs_mean_over_param.log`; eval: `/root/code/DSS/logs_commonsense/eval_commonsense_commonsense_Llama3-8B_dss_nobasis_abs_mean_over_param_nf180000_cand30000_gs3_ddp_scoringfull_20260522_090700_20260522_090700.log` | `/root/code/DSS/output/commonsense_Llama3-8B_dss_nobasis_abs_mean_over_param_nf180000_cand30000_gs3_ddp_scoringfull_20260522_090700` | `10000` | `0.7492` | `0.8993` | `0.8224` | `0.9470` | `0.8808` | `0.8285` | `0.9322` | `0.8680` | `0.8667` |
-| `snr` | `10` | completed | `commonsense_Llama3-8B_dss_nobasis_snr_nf180000_cand30000_gs10_ddp_scoringfull_20260522_204322` | `/root/code/DSS/logs_commonsense/20260522_204322_train_eval_snr.log`; eval: `/root/code/DSS/logs_commonsense/eval_commonsense_commonsense_Llama3-8B_dss_nobasis_snr_nf180000_cand30000_gs10_ddp_scoringfull_20260522_204322_20260522_204322.log` | `/root/code/DSS/output/commonsense_Llama3-8B_dss_nobasis_snr_nf180000_cand30000_gs10_ddp_scoringfull_20260522_204322` | `10000` | `0.7609` | `0.8977` | `0.8224` | `0.9478` | `0.8800` | `0.8251` | `0.9339` | `0.8800` | `0.8685` |
-| `newton_like` | `3` | completed | `commonsense_Llama3-8B_dss_nobasis_newton_like_nf180000_cand30000_gs3_ddp_scoringfull_20260523_094219` | `/root/code/DSS/logs_commonsense/20260523_094219_train_eval_newton_like.log`; eval: `/root/code/DSS/logs_commonsense/eval_commonsense_commonsense_Llama3-8B_dss_nobasis_newton_like_nf180000_cand30000_gs3_ddp_scoringfull_20260523_094219_20260523_094219.log` | `/root/code/DSS/output/commonsense_Llama3-8B_dss_nobasis_newton_like_nf180000_cand30000_gs3_ddp_scoringfull_20260523_094219` | `10000` | `0.7609` | `0.9010` | `0.8193` | `0.9477` | `0.8642` | `0.8294` | `0.9369` | `0.8820` | `0.8677` |
+| `abs_mean_over_param` | `3` | completed | `commonsense_Llama3-8B_dss_nobasis_abs_mean_over_param_nf180000_cand30000_gs3_ddp_scoringfull_20260522_090700` | `/root/code/DSS/logs_commonsense/20260522_090700_train_eval_abs_mean_over_param.log`; eval: `/root/code/DSS/logs_commonsense/eval_commonsense_commonsense_Llama3-8B_dss_nobasis_abs_mean_over_param_nf180000_cand30000_gs3_ddp_scoringfull_20260522_090700_20260522_090700.log` | `/root/code/DSS/output/commonsense_Llama3-8B_dss_nobasis_abs_mean_over_param_nf180000_cand30000_gs3_ddp_scoringfull_20260522_090700 (注：此处汇报的是 checkpoint-10000 的评测结果，不是最终权重)` | `10000 (注：非最终权重)` | `0.7492` | `0.8993` | `0.8224` | `0.9470` | `0.8808` | `0.8285` | `0.9322` | `0.8680` | `0.8667` |
+| `snr` | `10` | completed | `commonsense_Llama3-8B_dss_nobasis_snr_nf180000_cand30000_gs10_ddp_scoringfull_20260522_204322` | `/root/code/DSS/logs_commonsense/20260522_204322_train_eval_snr.log`; eval: `/root/code/DSS/logs_commonsense/eval_commonsense_snr_ckpt15966_20260527_1029.log` | `/root/code/DSS/output/commonsense_Llama3-8B_dss_nobasis_snr_nf180000_cand30000_gs10_ddp_scoringfull_20260522_204322/checkpoint-15966` | `15966` | `0.7627` | `0.9010` | `0.8224` | `0.9502` | `0.8769` | `0.8345` | `0.9289` | `0.8800` | `0.8696` |
+| `newton_like` | `3` | completed | `commonsense_Llama3-8B_dss_nobasis_newton_like_nf180000_cand30000_gs3_ddp_scoringfull_20260523_094219` | `/root/code/DSS/logs_commonsense/20260523_094219_train_eval_newton_like.log`; eval: `/root/code/DSS/logs_commonsense/eval_commonsense_newton_like_ckpt15966_20260527_1029.log` | `/root/code/DSS/output/commonsense_Llama3-8B_dss_nobasis_newton_like_nf180000_cand30000_gs3_ddp_scoringfull_20260523_094219/checkpoint-15966` | `15966` | `0.7554` | `0.8993` | `0.8178` | `0.9484` | `0.8635` | `0.8413` | `0.9377` | `0.8820` | `0.8682` |
 
 ## 最新方法
 
@@ -146,7 +146,7 @@
 
 - `run_name = commonsense_Llama3-8B_dss_nobasis_default_snr_nf180000_cand10000_gs10_20260524_092754`
 - `train_log = /root/code/DSS/logs_commonsense/20260524_092745_train_eval_default_snr_blockwise_singlegemm.log`
-- `eval_log = /root/code/DSS/logs_commonsense/eval_commonsense_commonsense_Llama3-8B_dss_nobasis_default_snr_nf180000_cand10000_gs10_20260524_092754_20260524_092754.log`
+- `eval_log = /root/code/DSS/logs_commonsense/eval_commonsense_default_snr_llama3_ckpt15966_20260527_1218.log`
 
 8 个任务结果：
 
@@ -185,19 +185,19 @@
 
 - `run_name = commonsense_Llama2-7B_dss_nobasis_default_snr_llama2_nf180000_cand10000_gs10_20260524_154851`
 - `train_log = /root/code/DSS/logs_commonsense/20260524_154840_train_eval_llama2_default_snr_blockwise_singlegemm.log`
-- `eval_log = /root/code/DSS/logs_commonsense/eval_commonsense_commonsense_Llama2-7B_dss_nobasis_default_snr_llama2_nf180000_cand10000_gs10_20260524_154851_20260524_154851.log`
+- `eval_log = /root/code/DSS/logs_commonsense/eval_commonsense_default_snr_llama2_ckpt15966_20260527_1218.log`
 
 8 个任务结果：
 
-- `boolq = 0.7278`
-- `piqa = 0.8509`
+- `boolq = 0.7336`
+- `piqa = 0.8526`
 - `social_i_qa = 0.8122`
-- `hellaswag = 0.8875`
-- `winogrande = 0.8437`
-- `ARC-Challenge = 0.7432`
-- `ARC-Easy = 0.8784`
-- `openbookqa = 0.8280`
-- `avg = 0.8215`
+- `hellaswag = 0.8895`
+- `winogrande = 0.8453`
+- `ARC-Challenge = 0.7534`
+- `ARC-Easy = 0.8834`
+- `openbookqa = 0.8160`
+- `avg = 0.8233`
 
 ## 备注模板
 

@@ -27,9 +27,10 @@ DATASET_PATH=${DATASET_PATH:-"${DATA_DIR}/math10k_${MAX_LENGTH}_prompt${MAX_PROM
 VAL_SET_SIZE=${VAL_SET_SIZE:-500}
 
 TARGET_MODULES=${TARGET_MODULES:-"qkvud"}
+PEFT_METHOD=${PEFT_METHOD:-"dss"}
 N_FREQUENCY=${N_FREQUENCY:-180000}
 CANDIDATE_SIZE=${CANDIDATE_SIZE:-30000}
-GRAD_STORE_STEPS=${GRAD_STORE_STEPS:-3}
+GRAD_STORE_STEPS=${GRAD_STORE_STEPS:-10}
 LOW=${LOW:-500}
 UP=${UP:-4000}
 RATIO=${RATIO:-0.1}
@@ -40,6 +41,15 @@ DSS_DROPOUT=${DSS_DROPOUT:-0.05}
 QUANTILE_LR=${QUANTILE_LR:-0.01}
 QUANTILE_ALPHA=${QUANTILE_ALPHA:-0.0}
 THRESHOLD_LOG_EVERY_STEPS=${THRESHOLD_LOG_EVERY_STEPS:-100}
+INIT_ENABLED=${INIT_ENABLED:-0}
+INIT_STEPS=${INIT_STEPS:-10}
+INIT_CANDIDATE_RATIO=${INIT_CANDIDATE_RATIO:-0.05}
+INIT_SEED_MODE=${INIT_SEED_MODE:-"threshold_only"}
+LORA_R=${LORA_R:-8}
+LORA_ALPHA=${LORA_ALPHA:-16}
+LORA_DROPOUT=${LORA_DROPOUT:-0.05}
+USE_RSLORA=${USE_RSLORA:-0}
+GRADIENT_CHECKPOINTING=${GRADIENT_CHECKPOINTING:-0}
 
 BATCH_SIZE=${BATCH_SIZE:-8}
 GRAD_ACCUM_STEPS=${GRAD_ACCUM_STEPS:-2}
@@ -48,7 +58,7 @@ MAX_STEPS=${MAX_STEPS:--1}
 PRECISION=${PRECISION:-"bf16"}
 LR=${LR:-"1e-4"}
 WEIGHT_DECAY=${WEIGHT_DECAY:-0.0}
-WARMUP_STEPS=${WARMUP_STEPS:-0}
+WARMUP_RATIO=${WARMUP_RATIO:-0.03}
 LOGGING_STEPS=${LOGGING_STEPS:-10}
 EVAL_STEPS=${EVAL_STEPS:-500}
 SAVE_STEPS=${SAVE_STEPS:-500}
@@ -62,7 +72,13 @@ MASTER_PORT=${MASTER_PORT:-29500}
 EXPERIMENT_RECORD_ENABLED=${EXPERIMENT_RECORD_ENABLED:-1}
 
 RUN_MODE=${RUN_MODE:-"${THRESHOLD_MODE}"}
-RUN_NAME=${RUN_NAME:-"math_${MODEL_NAME}_dss_nobasis_${RUN_MODE}_nf${N_FREQUENCY}_cand${CANDIDATE_SIZE}_gs${GRAD_STORE_STEPS}_lr${LR}_${TIMESTAMP}"}
+if [[ -z "${RUN_NAME:-}" ]]; then
+    if [[ "${PEFT_METHOD}" == "dss" ]]; then
+        RUN_NAME="math_${MODEL_NAME}_dss_nobasis_${RUN_MODE}_nf${N_FREQUENCY}_cand${CANDIDATE_SIZE}_gs${GRAD_STORE_STEPS}_lr${LR}_${TIMESTAMP}"
+    else
+        RUN_NAME="math_${MODEL_NAME}_${PEFT_METHOD}_r${LORA_R}_a${LORA_ALPHA}_lr${LR}_${TIMESTAMP}"
+    fi
+fi
 OUTPUT_DIR=${OUTPUT_DIR:-"${OUTPUT_ROOT}/${RUN_NAME}"}
 LOG_FILE=${LOG_FILE:-"${LOG_ROOT}/${TIMESTAMP}_math_train_${RUN_MODE}.log"}
 
@@ -114,6 +130,7 @@ cd "${REMOTE_PROJECT_ROOT}"
     echo "MAX_PROMPT_LENGTH=${MAX_PROMPT_LENGTH}"
     echo "VAL_SET_SIZE=${VAL_SET_SIZE}"
     echo "TARGET_MODULES=${TARGET_MODULES}"
+    echo "PEFT_METHOD=${PEFT_METHOD}"
     echo "N_FREQUENCY=${N_FREQUENCY}"
     echo "CANDIDATE_SIZE=${CANDIDATE_SIZE}"
     echo "GRAD_STORE_STEPS=${GRAD_STORE_STEPS}"
@@ -122,10 +139,20 @@ cd "${REMOTE_PROJECT_ROOT}"
     echo "RATIO=${RATIO}"
     echo "THRESHOLD_MODE=${THRESHOLD_MODE}"
     echo "SCORE_METHOD=${SCORE_METHOD}"
+    echo "INIT_ENABLED=${INIT_ENABLED}"
+    echo "INIT_STEPS=${INIT_STEPS}"
+    echo "INIT_CANDIDATE_RATIO=${INIT_CANDIDATE_RATIO}"
+    echo "INIT_SEED_MODE=${INIT_SEED_MODE}"
+    echo "LORA_R=${LORA_R}"
+    echo "LORA_ALPHA=${LORA_ALPHA}"
+    echo "LORA_DROPOUT=${LORA_DROPOUT}"
+    echo "USE_RSLORA=${USE_RSLORA}"
+    echo "GRADIENT_CHECKPOINTING=${GRADIENT_CHECKPOINTING}"
     echo "BATCH_SIZE=${BATCH_SIZE}"
     echo "GRAD_ACCUM_STEPS=${GRAD_ACCUM_STEPS}"
     echo "NUM_EPOCHS=${NUM_EPOCHS}"
     echo "LR=${LR}"
+    echo "WARMUP_RATIO=${WARMUP_RATIO}"
     echo "EVAL_STEPS=${EVAL_STEPS}"
     echo "SAVE_STEPS=${SAVE_STEPS}"
     echo "OUTPUT_DIR=${OUTPUT_DIR}"
@@ -143,6 +170,7 @@ train_cmd=(
     --max_length "${MAX_LENGTH}"
     --val_set_size "${VAL_SET_SIZE}"
     --target_modules "${TARGET_MODULES}"
+    --peft_method "${PEFT_METHOD}"
     --n_frequency "${N_FREQUENCY}"
     --candidate_size "${CANDIDATE_SIZE}"
     --grad_store_steps "${GRAD_STORE_STEPS}"
@@ -156,6 +184,12 @@ train_cmd=(
     --quantile_lr "${QUANTILE_LR}"
     --quantile_alpha "${QUANTILE_ALPHA}"
     --threshold_log_every_steps "${THRESHOLD_LOG_EVERY_STEPS}"
+    --init_steps "${INIT_STEPS}"
+    --init_candidate_ratio "${INIT_CANDIDATE_RATIO}"
+    --init_seed_mode "${INIT_SEED_MODE}"
+    --lora_r "${LORA_R}"
+    --lora_alpha "${LORA_ALPHA}"
+    --lora_dropout "${LORA_DROPOUT}"
     --batch_size "${BATCH_SIZE}"
     --gradient_accumulation_steps "${GRAD_ACCUM_STEPS}"
     --num_epochs "${NUM_EPOCHS}"
@@ -163,7 +197,7 @@ train_cmd=(
     --precision "${PRECISION}"
     --lr "${LR}"
     --weight_decay "${WEIGHT_DECAY}"
-    --warmup_steps "${WARMUP_STEPS}"
+    --warmup_ratio "${WARMUP_RATIO}"
     --logging_steps "${LOGGING_STEPS}"
     --eval_steps "${EVAL_STEPS}"
     --save_steps "${SAVE_STEPS}"
@@ -176,6 +210,15 @@ train_cmd=(
 
 if [[ "${LOAD_BEST_MODEL_AT_END}" == "1" ]]; then
     train_cmd+=(--load_best_model_at_end)
+fi
+if [[ "${INIT_ENABLED}" == "1" ]]; then
+    train_cmd+=(--init_enabled)
+fi
+if [[ "${USE_RSLORA}" == "1" ]]; then
+    train_cmd+=(--use_rslora)
+fi
+if [[ "${GRADIENT_CHECKPOINTING}" == "1" ]]; then
+    train_cmd+=(--gradient_checkpointing)
 fi
 if [[ -n "${RESUME_FROM_CHECKPOINT}" ]]; then
     train_cmd+=(--resume_from_checkpoint "${RESUME_FROM_CHECKPOINT}")

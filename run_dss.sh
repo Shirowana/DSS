@@ -42,9 +42,10 @@ fi
 DATA_DIR=${DATA_DIR:-"${REMOTE_DATA_ROOT}/commonsense_new"}
 MAX_LENGTH=${MAX_LENGTH:-256}
 DATASET_PATH=${DATASET_PATH:-"${DATA_DIR}/train_all_${MAX_LENGTH}_OnlyOutput_${MODEL_NAME}"}
-VAL_SET_SIZE=${VAL_SET_SIZE:-120}
+VAL_SET_SIZE=${VAL_SET_SIZE:-500}
 
 TARGET_MODULES=${TARGET_MODULES:-"qkvud"}
+PEFT_METHOD=${PEFT_METHOD:-"dss"}
 N_FREQUENCY=${N_FREQUENCY:-180000}
 CANDIDATE_SIZE=${CANDIDATE_SIZE:-10000}
 GRAD_STORE_STEPS=${GRAD_STORE_STEPS:-10}
@@ -62,6 +63,10 @@ INIT_ENABLED=${INIT_ENABLED:-0}
 INIT_STEPS=${INIT_STEPS:-10}
 INIT_CANDIDATE_RATIO=${INIT_CANDIDATE_RATIO:-0.05}
 INIT_SEED_MODE=${INIT_SEED_MODE:-"threshold_only"}
+LORA_R=${LORA_R:-8}
+LORA_ALPHA=${LORA_ALPHA:-16}
+LORA_DROPOUT=${LORA_DROPOUT:-0.05}
+USE_RSLORA=${USE_RSLORA:-0}
 
 BATCH_SIZE=${BATCH_SIZE:-16}
 GRAD_ACCUM_STEPS=${GRAD_ACCUM_STEPS:-1}
@@ -70,7 +75,7 @@ MAX_STEPS=${MAX_STEPS:--1}
 PRECISION=${PRECISION:-"bf16"}
 LR=${LR:-"8e-5"}
 WEIGHT_DECAY=${WEIGHT_DECAY:-0.0}
-WARMUP_STEPS=${WARMUP_STEPS:-100}
+WARMUP_RATIO=${WARMUP_RATIO:-0.03}
 LOGGING_STEPS=${LOGGING_STEPS:-10}
 EVAL_STEPS=${EVAL_STEPS:-10000}
 SAVE_STEPS=${SAVE_STEPS:-10000}
@@ -85,7 +90,13 @@ MASTER_PORT=${MASTER_PORT:-29500}
 EXPERIMENT_RECORD_ENABLED=${EXPERIMENT_RECORD_ENABLED:-1}
 EXPERIMENT_MD=${EXPERIMENT_MD:-}
 
-RUN_NAME=${RUN_NAME:-"commonsense_${MODEL_NAME}_dss_nobasis_nf${N_FREQUENCY}_cand${CANDIDATE_SIZE}_gs${GRAD_STORE_STEPS}_${TIMESTAMP}"}
+if [[ -z "${RUN_NAME:-}" ]]; then
+    if [[ "${PEFT_METHOD}" == "dss" ]]; then
+        RUN_NAME="commonsense_${MODEL_NAME}_dss_nobasis_nf${N_FREQUENCY}_cand${CANDIDATE_SIZE}_gs${GRAD_STORE_STEPS}_${TIMESTAMP}"
+    else
+        RUN_NAME="commonsense_${MODEL_NAME}_${PEFT_METHOD}_r${LORA_R}_a${LORA_ALPHA}_lr${LR}_${TIMESTAMP}"
+    fi
+fi
 OUTPUT_DIR=${OUTPUT_DIR:-"${OUTPUT_ROOT}/${RUN_NAME}"}
 LOG_FILE=${LOG_FILE:-"${LOG_ROOT}/${TIMESTAMP}_dss_nobasis.log"}
 
@@ -145,6 +156,7 @@ cd "${REMOTE_PROJECT_ROOT}"
     echo "MAX_LENGTH=${MAX_LENGTH}"
     echo "VAL_SET_SIZE=${VAL_SET_SIZE}"
     echo "TARGET_MODULES=${TARGET_MODULES}"
+    echo "PEFT_METHOD=${PEFT_METHOD}"
     echo "N_FREQUENCY=${N_FREQUENCY}"
     echo "CANDIDATE_SIZE=${CANDIDATE_SIZE}"
     echo "GRAD_STORE_STEPS=${GRAD_STORE_STEPS}"
@@ -162,6 +174,10 @@ cd "${REMOTE_PROJECT_ROOT}"
     echo "INIT_STEPS=${INIT_STEPS}"
     echo "INIT_CANDIDATE_RATIO=${INIT_CANDIDATE_RATIO}"
     echo "INIT_SEED_MODE=${INIT_SEED_MODE}"
+    echo "LORA_R=${LORA_R}"
+    echo "LORA_ALPHA=${LORA_ALPHA}"
+    echo "LORA_DROPOUT=${LORA_DROPOUT}"
+    echo "USE_RSLORA=${USE_RSLORA}"
     echo "BATCH_SIZE=${BATCH_SIZE}"
     echo "GRAD_ACCUM_STEPS=${GRAD_ACCUM_STEPS}"
     echo "NUM_EPOCHS=${NUM_EPOCHS}"
@@ -169,7 +185,7 @@ cd "${REMOTE_PROJECT_ROOT}"
     echo "PRECISION=${PRECISION}"
     echo "LR=${LR}"
     echo "WEIGHT_DECAY=${WEIGHT_DECAY}"
-    echo "WARMUP_STEPS=${WARMUP_STEPS}"
+    echo "WARMUP_RATIO=${WARMUP_RATIO}"
     echo "EVAL_STEPS=${EVAL_STEPS}"
     echo "SAVE_STEPS=${SAVE_STEPS}"
     echo "LOAD_BEST_MODEL_AT_END=${LOAD_BEST_MODEL_AT_END}"
@@ -203,6 +219,7 @@ cmd=(
     --max_length "${MAX_LENGTH}"
     --val_set_size "${VAL_SET_SIZE}"
     --target_modules "${TARGET_MODULES}"
+    --peft_method "${PEFT_METHOD}"
     --n_frequency "${N_FREQUENCY}"
     --candidate_size "${CANDIDATE_SIZE}"
     --grad_store_steps "${GRAD_STORE_STEPS}"
@@ -219,6 +236,9 @@ cmd=(
     --init_steps "${INIT_STEPS}"
     --init_candidate_ratio "${INIT_CANDIDATE_RATIO}"
     --init_seed_mode "${INIT_SEED_MODE}"
+    --lora_r "${LORA_R}"
+    --lora_alpha "${LORA_ALPHA}"
+    --lora_dropout "${LORA_DROPOUT}"
     --batch_size "${BATCH_SIZE}"
     --gradient_accumulation_steps "${GRAD_ACCUM_STEPS}"
     --num_epochs "${NUM_EPOCHS}"
@@ -226,7 +246,7 @@ cmd=(
     --precision "${PRECISION}"
     --lr "${LR}"
     --weight_decay "${WEIGHT_DECAY}"
-    --warmup_steps "${WARMUP_STEPS}"
+    --warmup_ratio "${WARMUP_RATIO}"
     --logging_steps "${LOGGING_STEPS}"
     --eval_steps "${EVAL_STEPS}"
     --save_steps "${SAVE_STEPS}"
@@ -239,6 +259,9 @@ cmd=(
 
 if [[ "${INIT_ENABLED}" == "1" ]]; then
     cmd+=(--init_enabled)
+fi
+if [[ "${USE_RSLORA}" == "1" ]]; then
+    cmd+=(--use_rslora)
 fi
 
 if [[ "${LOAD_BEST_MODEL_AT_END}" == "1" ]]; then

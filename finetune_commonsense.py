@@ -23,7 +23,7 @@ from torch.nn.utils.rnn import pad_sequence
 from transformers import AutoModelForCausalLM, AutoTokenizer, Trainer, TrainingArguments, set_seed
 
 try:
-    from peft import get_peft_model
+    from peft import LoraConfig, TaskType, get_peft_model
 except ImportError as exc:  # pragma: no cover
     raise RuntimeError("This script requires `peft` with DSS registration support.") from exc
 
@@ -48,6 +48,12 @@ MODULE_MAP = {
     "d": "down_proj",
     "o": "o_proj",
     "g": "gate_proj",
+}
+
+TARGET_MODULE_ALIASES = {
+    "qkvud": ["q_proj", "k_proj", "v_proj", "up_proj", "down_proj"],
+    "qkvupdown": ["q_proj", "k_proj", "v_proj", "up_proj", "down_proj"],
+    "qkvod": ["q_proj", "k_proj", "v_proj", "o_proj", "down_proj"],
 }
 
 COMMONSENSE_TASKS = [
@@ -75,6 +81,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--val_set_size", type=int, default=0)
 
     parser.add_argument("--target_modules", type=str, default="qkvud")
+    parser.add_argument("--peft_method", type=str, default="dss", choices=["dss", "lora", "dora"])
     parser.add_argument("--n_frequency", type=int, default=8)
     parser.add_argument("--candidate_size", type=int, default=32)
     parser.add_argument("--grad_store_steps", type=int, default=10)
@@ -105,13 +112,17 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--init_steps", type=int, default=10)
     parser.add_argument("--init_candidate_ratio", type=float, default=0.05)
     parser.add_argument("--init_seed_mode", type=str, default="threshold_only", choices=["threshold_only", "seed_elite"])
+    parser.add_argument("--lora_r", type=int, default=8)
+    parser.add_argument("--lora_alpha", type=int, default=16)
+    parser.add_argument("--lora_dropout", type=float, default=0.05)
+    parser.add_argument("--use_rslora", action="store_true")
 
     parser.add_argument("--lr", type=float, default=5e-4)
     parser.add_argument("--batch_size", type=int, default=4)
     parser.add_argument("--gradient_accumulation_steps", type=int, default=4)
     parser.add_argument("--num_epochs", type=float, default=3)
     parser.add_argument("--max_steps", type=int, default=-1)
-    parser.add_argument("--warmup_steps", type=int, default=100)
+    parser.add_argument("--warmup_ratio", type=float, default=0.03)
     parser.add_argument("--weight_decay", type=float, default=0.0)
     parser.add_argument("--scheduler", type=str, default="linear")
     parser.add_argument("--precision", type=str, default="bf16", choices=["fp32", "fp16", "bf16"])
@@ -133,10 +144,81 @@ def parse_args() -> argparse.Namespace:
 
 
 def build_run_name(args: argparse.Namespace, timestamp: str) -> str:
+    if args.peft_method == "dss":
+        return (
+            f"commonsense_{args.model_name}_dss_"
+            f"nf{args.n_frequency}_cand{args.candidate_size}_gs{args.grad_store_steps}_{timestamp}"
+        )
     return (
-        f"commonsense_{args.model_name}_dss_"
-        f"nf{args.n_frequency}_cand{args.candidate_size}_gs{args.grad_store_steps}_{timestamp}"
+        f"commonsense_{args.model_name}_{args.peft_method}_"
+        f"r{args.lora_r}_a{args.lora_alpha}_lr{args.lr}_{timestamp}"
     )
+
+
+def build_peft_model(model, args: argparse.Namespace, target_modules: list[str]):
+    if args.peft_method == "dss":
+        peft_config = DSSConfig(
+            target_modules=target_modules,
+            n_frequency=args.n_frequency,
+            candidate_size=args.candidate_size,
+            grad_store_steps=args.grad_store_steps,
+            low=args.low,
+            up=args.up,
+            ratio=args.ratio,
+            threshold_mode=args.threshold_mode,
+            score_method=args.score_method,
+            score_eps=args.score_eps,
+            dropout=args.dropout,
+            quantile_lr=args.quantile_lr,
+            quantile_alpha=args.quantile_alpha,
+            threshold_log_every_steps=args.threshold_log_every_steps,
+            init_enabled=args.init_enabled,
+            init_steps=args.init_steps,
+            init_candidate_ratio=args.init_candidate_ratio,
+            init_seed_mode=args.init_seed_mode,
+            bias="none",
+        )
+    else:
+        peft_config = LoraConfig(
+            r=args.lora_r,
+            lora_alpha=args.lora_alpha,
+            lora_dropout=args.lora_dropout,
+            target_modules=target_modules,
+            bias="none",
+            task_type=TaskType.CAUSAL_LM,
+            use_rslora=args.use_rslora,
+            use_dora=(args.peft_method == "dora"),
+        )
+    return get_peft_model(model, peft_config)
+
+
+def resolve_target_modules(spec: str) -> list[str]:
+    normalized = (spec or "").strip().lower()
+    if not normalized:
+        return []
+    if normalized in TARGET_MODULE_ALIASES:
+        return TARGET_MODULE_ALIASES[normalized]
+
+    resolved: list[str] = []
+    i = 0
+    while i < len(normalized):
+        if normalized.startswith("down", i):
+            key = "d"
+            i += 4
+        elif normalized.startswith("up", i):
+            key = "u"
+            i += 2
+        elif normalized.startswith("gate", i):
+            key = "g"
+            i += 4
+        else:
+            key = normalized[i]
+            i += 1
+
+        module_name = MODULE_MAP.get(key)
+        if module_name and module_name not in resolved:
+            resolved.append(module_name)
+    return resolved
 
 
 def resolve_precision(name: str) -> torch.dtype:
@@ -190,6 +272,14 @@ def resolve_train_eval_datasets(dataset_obj, val_set_size: int, seed: int) -> tu
         split = full_train_dataset.train_test_split(test_size=val_set_size, shuffle=True, seed=seed)
         return split["train"], split["test"]
     return full_train_dataset, None
+
+
+def latest_checkpoint_dir(output_dir: Path) -> Path | None:
+    checkpoint_dirs = sorted(
+        [path for path in output_dir.glob("checkpoint-*") if path.is_dir()],
+        key=lambda p: int(p.name.split("-", 1)[1]),
+    )
+    return checkpoint_dirs[-1] if checkpoint_dirs else None
 
 
 def build_balanced_init_dataset(train_dataset: Dataset, batch_size: int, init_steps: int, seed: int) -> Dataset:
@@ -472,10 +562,14 @@ def main() -> None:
 
     if args.val_set_size < 0:
         raise ValueError("`--val_set_size` must be non-negative.")
+    if not 0.0 <= args.warmup_ratio <= 1.0:
+        raise ValueError("`--warmup_ratio` must be within [0, 1].")
     if args.load_best_model_at_end and args.val_set_size <= 0:
         raise ValueError("`--load_best_model_at_end` requires `--val_set_size > 0`.")
     if args.val_set_size > 0 and args.eval_steps <= 0:
         raise ValueError("`--eval_steps` must be positive when using a validation split.")
+    if args.peft_method != "dss" and args.init_enabled:
+        raise ValueError("`--init_enabled` is only supported for `--peft_method dss`.")
     model_dir = args.model_cache_dir or os.environ.get("MODEL_CACHE_DIR")
     torch_dtype = resolve_precision(args.precision)
     load_name = args.model_path or MODEL_MAP[args.model_name]
@@ -493,32 +587,20 @@ def main() -> None:
         model.gradient_checkpointing_enable()
         model.config.use_cache = False
 
-    target_modules = [MODULE_MAP[key] for key in args.target_modules if key in MODULE_MAP]
+    target_modules = resolve_target_modules(args.target_modules)
     if not target_modules:
         raise ValueError("`--target_modules` did not resolve to any known module names.")
 
-    dss_config = DSSConfig(
-        target_modules=target_modules,
-        n_frequency=args.n_frequency,
-        candidate_size=args.candidate_size,
-        grad_store_steps=args.grad_store_steps,
-        low=args.low,
-        up=args.up,
-        ratio=args.ratio,
-        threshold_mode=args.threshold_mode,
-        score_method=args.score_method,
-        score_eps=args.score_eps,
-        dropout=args.dropout,
-        quantile_lr=args.quantile_lr,
-        quantile_alpha=args.quantile_alpha,
-        threshold_log_every_steps=args.threshold_log_every_steps,
-        init_enabled=args.init_enabled,
-        init_steps=args.init_steps,
-        init_candidate_ratio=args.init_candidate_ratio,
-        init_seed_mode=args.init_seed_mode,
-        bias="none",
-    )
-    model = get_peft_model(model, dss_config)
+    if args.peft_method != "dss":
+        print(
+            "[PEFT] Using "
+            f"{args.peft_method}; DSS-only args are inactive: "
+            "n_frequency, candidate_size, grad_store_steps, low, up, ratio, "
+            "threshold_mode, score_method, score_eps, quantile_lr, quantile_alpha, "
+            "threshold_log_every_steps, init_*",
+            flush=True,
+        )
+    model = build_peft_model(model, args, target_modules)
 
     if torch.cuda.is_available():
         if local_rank >= 0:
@@ -577,7 +659,7 @@ def main() -> None:
         gradient_accumulation_steps=args.gradient_accumulation_steps,
         learning_rate=args.lr,
         lr_scheduler_type=args.scheduler,
-        warmup_steps=args.warmup_steps,
+        warmup_ratio=args.warmup_ratio,
         weight_decay=args.weight_decay,
         logging_steps=args.logging_steps,
         eval_strategy=eval_strategy,
@@ -598,7 +680,7 @@ def main() -> None:
         report_to=[] if args.report_to.lower() in {"none", "no", "false", "0"} else [args.report_to],
         run_name=run_name,
         disable_tqdm=False,
-        ddp_find_unused_parameters=True if world_size > 1 else None,
+        ddp_find_unused_parameters=(True if (world_size > 1 and args.peft_method == "dss") else False if world_size > 1 else None),
     )
 
     trainer = Trainer(
@@ -680,6 +762,29 @@ def main() -> None:
         )
     with maybe_hide_unsafe_resume_state(args.resume_from_checkpoint):
         trainer.train(resume_from_checkpoint=args.resume_from_checkpoint or None)
+    if has_eval:
+        best_checkpoint = trainer.state.best_model_checkpoint or ""
+        final_checkpoint = latest_checkpoint_dir(output_dir)
+        final_checkpoint_step = trainer.state.global_step
+
+        if final_checkpoint is not None:
+            print(f"Loading final checkpoint for validation: {final_checkpoint}")
+            trainer._load_from_checkpoint(str(final_checkpoint))
+
+        final_eval_metrics = trainer.evaluate(metric_key_prefix="final_eval")
+        final_eval_metrics["final_eval_step"] = final_checkpoint_step
+        final_eval_metrics["final_eval_checkpoint"] = str(final_checkpoint) if final_checkpoint is not None else ""
+        with (output_dir / "final_eval_metrics.json").open("w", encoding="utf-8") as handle:
+            json.dump(final_eval_metrics, handle, indent=2, ensure_ascii=False)
+        print(
+            "Final-checkpoint validation complete: "
+            f"step={final_checkpoint_step} "
+            f"checkpoint={final_eval_metrics.get('final_eval_checkpoint')} "
+            f"final_eval_loss={final_eval_metrics.get('final_eval_loss')}"
+        )
+        if args.load_best_model_at_end and best_checkpoint:
+            print(f"Reloading best checkpoint for final adapter export: {best_checkpoint}")
+            trainer._load_from_checkpoint(best_checkpoint)
     trainer.save_model(str(output_dir))
     print(f"Training complete. Adapter saved to {output_dir}")
 

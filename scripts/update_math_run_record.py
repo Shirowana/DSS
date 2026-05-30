@@ -99,6 +99,14 @@ def parse_trainer_state(output_dir: Path) -> dict:
     }
 
 
+def parse_final_eval_metrics(output_dir: Path) -> dict:
+    metrics = load_json(output_dir / "final_eval_metrics.json")
+    return {
+        "final_eval_loss": metrics.get("final_eval_loss", ""),
+        "final_eval_step": metrics.get("final_eval_step", ""),
+    }
+
+
 def expected_total(data_dir: Path, dataset: str) -> int | None:
     path = data_dir / DATASET_DIR_NAMES[dataset] / "test.json"
     if not path.exists():
@@ -114,28 +122,37 @@ def update_training_record(record: dict, args: argparse.Namespace) -> None:
     training_args = load_json(output_dir / "training_args.json")
     log_summary = parse_training_log(Path(args.log_file)) if args.log_file else {}
     trainer_state = parse_trainer_state(output_dir)
+    final_eval_metrics = parse_final_eval_metrics(output_dir)
 
     num_gpus = int(log_summary.get("num_gpus") or 1)
     batch_size_per_gpu = int(training_args.get("batch_size") or 0)
     grad_accum = int(training_args.get("gradient_accumulation_steps") or 1)
+    method = str(training_args.get("peft_method") or "dss").lower()
+    is_dss = method == "dss"
 
     record["run_name"] = args.run_name
     record["code_version"] = git_code_version(Path(args.project_root))
     training_completed = log_summary.get("training_completed") == "1"
     record["training"] = {
         "model_name": training_args.get("model_name", ""),
-        "method": "DSS",
+        "method": method,
         "target_modules": training_args.get("target_modules", ""),
-        "n_frequency": training_args.get("n_frequency", ""),
-        "candidate_size": training_args.get("candidate_size", ""),
-        "grad_store_steps": training_args.get("grad_store_steps", ""),
-        "ratio": training_args.get("ratio", ""),
-        "low": training_args.get("low", ""),
-        "up": training_args.get("up", ""),
-        "threshold_mode": training_args.get("threshold_mode", ""),
-        "score_method": training_args.get("score_method", ""),
-        "dropout": training_args.get("dropout", ""),
+        "n_frequency": training_args.get("n_frequency", "") if is_dss else "",
+        "candidate_size": training_args.get("candidate_size", "") if is_dss else "",
+        "grad_store_steps": training_args.get("grad_store_steps", "") if is_dss else "",
+        "ratio": training_args.get("ratio", "") if is_dss else "",
+        "low": training_args.get("low", "") if is_dss else "",
+        "up": training_args.get("up", "") if is_dss else "",
+        "threshold_mode": training_args.get("threshold_mode", "") if is_dss else "",
+        "score_method": training_args.get("score_method", "") if is_dss else "",
+        "dropout": training_args.get("dropout", "") if is_dss else "",
+        "lora_r": training_args.get("lora_r", "") if not is_dss else "",
+        "lora_alpha": training_args.get("lora_alpha", "") if not is_dss else "",
+        "lora_dropout": training_args.get("lora_dropout", "") if not is_dss else "",
+        "use_rslora": int(bool(training_args.get("use_rslora", False))) if not is_dss else "",
+        "use_dora": int(method == "dora") if not is_dss else "",
         "lr": training_args.get("lr", ""),
+        "warmup_ratio": training_args.get("warmup_ratio", ""),
         "batch_size_per_gpu": batch_size_per_gpu,
         "num_gpus": num_gpus,
         "global_batch_size": batch_size_per_gpu * grad_accum * num_gpus,
@@ -151,6 +168,8 @@ def update_training_record(record: dict, args: argparse.Namespace) -> None:
         "train_loss_final": log_summary.get("train_loss_final", "") if training_completed else "",
         "eval_loss_best": trainer_state.get("eval_loss_best", "") if training_completed else "",
         "best_step": trainer_state.get("best_step", "") if training_completed else "",
+        "final_eval_loss": final_eval_metrics.get("final_eval_loss", "") if training_completed else "",
+        "final_eval_step": final_eval_metrics.get("final_eval_step", "") if training_completed else "",
     }
     append_note(record, args.notes)
 
