@@ -2,6 +2,8 @@ __pycache__/
 *.pyc
 
 output/
+output_llm_adapters/
+output_math/
 wandb/
 logs_commonsense/
 logs_gsm8k/
@@ -9,4 +11,5 @@ logs_math/
 results_commonsense/
 results_gsm8k/
 results_math/
+results_commonsense_llm_adapters/
 experiments/
