@@ -4,7 +4,7 @@
 
 这个项目当前在做的是：基于 `Llama3-8B` 的 commonsense 多任务指令微调，研究一套自定义的稀疏 PEFT 方法 `DSS`，并重点比较不同 threshold 策略、不同 budget、以及不同候选筛选统计量对最终效果的影响。当前主线方法不是 LoRA，也不是带 basis 的旧 DSS，而是已经收敛成一版 **`no-basis, stage1-only DSS`**。
 
-近期新增主线：数学推理任务。新 Agent 如果接到 Math10K、GSM8K、SVAMP、AQuA、MAWPS、`train_eval_math.sh` 或 `evaluate_math_reasoning.py` 相关请求，应优先阅读 [math_task.md](/root/code/DSS/math_task.md)。该文档是当前执行版协议，旧的 [数学推理任务.md](/root/code/DSS/数学推理任务.md) 只作为历史讨论归档。
+近期新增主线：数学推理任务。新 Agent 如果接到 Math10K、GSM8K、SVAMP、AQuA、MAWPS、`train_eval_math.sh` 或 `evaluate_math_reasoning.py` 相关请求，应优先阅读 [math_task.md](/root/code/DSS/math_task.md)。该文档是当前执行版协议。
 
 数学任务当前入口：
 
